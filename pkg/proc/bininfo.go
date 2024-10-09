@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	"github.com/go-delve/delve/pkg/internal/gosym"
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc/debuginfod"
+	"github.com/go-delve/delve/pkg/proc/evalop"
 	"github.com/hashicorp/golang-lru/simplelru"
 )
 
@@ -109,7 +111,8 @@ type BinaryInfo struct {
 	// Go 1.17 register ABI is enabled.
 	regabi bool
 
-	logger logflags.Logger
+	debugPinnerFn *Function
+	logger        logflags.Logger
 }
 
 var (
@@ -2297,7 +2300,7 @@ func loadBinaryInfoGoRuntimeCommon(bi *BinaryInfo, image *Image, cu *compileUnit
 		bi.Sources = append(bi.Sources, f)
 	}
 	sort.Strings(bi.Sources)
-	bi.Sources = uniq(bi.Sources)
+	bi.Sources = slices.Compact(bi.Sources)
 	return nil
 }
 
@@ -2536,7 +2539,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 		}
 	}
 	sort.Strings(bi.Sources)
-	bi.Sources = uniq(bi.Sources)
+	bi.Sources = slices.Compact(bi.Sources)
 
 	if cont != nil {
 		cont()
@@ -2573,11 +2576,21 @@ func (bi *BinaryInfo) LookupFunc() map[string][]*Function {
 }
 
 func (bi *BinaryInfo) lookupOneFunc(name string) *Function {
+	if name == evalop.DebugPinnerFunctionName && bi.debugPinnerFn != nil {
+		return bi.debugPinnerFn
+	}
 	fns := bi.LookupFunc()[name]
 	if fns == nil {
 		return nil
 	}
+	if name == evalop.DebugPinnerFunctionName {
+		bi.debugPinnerFn = fns[0]
+	}
 	return fns[0]
+}
+
+func (bi *BinaryInfo) hasDebugPinner() bool {
+	return bi.lookupOneFunc(evalop.DebugPinnerFunctionName) != nil
 }
 
 // loadDebugInfoMapsCompileUnit loads entry from a single compile unit.
@@ -2858,21 +2871,6 @@ func (bi *BinaryInfo) loadDebugInfoMapsInlinedCalls(ctxt *loadDebugInfoMapsConte
 		}
 		reader.SkipChildren()
 	}
-}
-
-func uniq(s []string) []string {
-	if len(s) == 0 {
-		return s
-	}
-	src, dst := 1, 1
-	for src < len(s) {
-		if s[src] != s[dst-1] {
-			s[dst] = s[src]
-			dst++
-		}
-		src++
-	}
-	return s[:dst]
 }
 
 func (bi *BinaryInfo) expandPackagesInType(expr ast.Expr) {
