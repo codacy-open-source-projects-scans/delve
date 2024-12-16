@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	logflags.Setup(logConf != "", logConf, "")
-	os.Exit(test.RunTestsWithFixtures(m))
+	test.RunTestsWithFixtures(m)
 }
 
 type FakeTerminal struct {
@@ -1231,7 +1231,6 @@ func TestHitCondBreakpoint(t *testing.T) {
 		if !strings.Contains(out, "2\n") {
 			t.Fatalf("wrong value of j")
 		}
-		term.MustExec("toggle bp1")
 		listIsAt(t, term, "continue", 16, -1, -1)
 		// second g hit
 		out = term.MustExec("print j")

@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	logflags.Setup(logOutput != "", logOutput, "")
-	os.Exit(protest.RunTestsWithFixtures(m))
+	protest.RunTestsWithFixtures(m)
 }
 
 func withTestClient2(name string, t *testing.T, fn func(c service.Client)) {
@@ -625,66 +625,46 @@ func TestClientServer_disableHitCondLSSBreakpoint(t *testing.T) {
 			Line:    7,
 			HitCond: "< 3",
 		})
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
+		assertNoError(err, t, "CreateBreakpoint")
+		bp, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 8})
+		assertNoError(err, t, "CreateBreakpoint")
+
+		if len(bp.Addrs) == 0 {
+			t.Fatalf("no addresses for breakpoint")
 		}
 
-		state := <-c.Continue()
-		if state.Err != nil {
-			t.Fatalf("Unexpected error: %v, state: %#v", state.Err, state)
+		continueTo := func(ln int, ival string) {
+			state := <-c.Continue()
+			assertNoError(state.Err, t, fmt.Sprintf("Unexpected error: %v, state: %#v", state.Err, state))
+
+			f, l := state.CurrentThread.File, state.CurrentThread.Line
+			if f != fp || l != ln {
+				t.Fatalf("Program did not hit breakpoint %s:%d", f, l)
+			}
+
+			if ival == "" {
+				return
+			}
+
+			ivar, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "i", normalLoadConfig)
+			assertNoError(err, t, "EvalVariable")
+
+			t.Logf("ivar: %s", ivar.SinglelineString())
+
+			if ivar.Value != ival {
+				t.Fatalf("Wrong variable value: %s", ivar.Value)
+			}
 		}
 
-		f, l := state.CurrentThread.File, state.CurrentThread.Line
-		if f != "break.go" && l != 7 {
-			t.Fatal("Program did not hit breakpoint")
-		}
-
-		ivar, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "i", normalLoadConfig)
-		assertNoError(err, t, "EvalVariable")
-
-		t.Logf("ivar: %s", ivar.SinglelineString())
-
-		if ivar.Value != "1" {
-			t.Fatalf("Wrong variable value: %s", ivar.Value)
-		}
-
-		bp, err := c.GetBreakpoint(hitCondBp.ID)
-		assertNoError(err, t, "GetBreakpoint()")
-
-		if bp.Disabled {
-			t.Fatalf(
-				"Hit condition %s is still satisfiable but breakpoint has been disabled",
-				bp.HitCond,
-			)
-		}
-
-		state = <-c.Continue()
-		if state.Err != nil {
-			t.Fatalf("Unexpected error: %v, state: %#v", state.Err, state)
-		}
-
-		f, l = state.CurrentThread.File, state.CurrentThread.Line
-		if f != "break.go" && l != 7 {
-			t.Fatal("Program did not hit breakpoint")
-		}
-
-		ivar, err = c.EvalVariable(api.EvalScope{GoroutineID: -1}, "i", normalLoadConfig)
-		assertNoError(err, t, "EvalVariable")
-
-		t.Logf("ivar: %s", ivar.SinglelineString())
-
-		if ivar.Value != "2" {
-			t.Fatalf("Wrong variable value: %s", ivar.Value)
-		}
+		continueTo(7, "1")
+		continueTo(7, "2")
+		continueTo(8, "")
 
 		bp, err = c.GetBreakpoint(hitCondBp.ID)
 		assertNoError(err, t, "GetBreakpoint()")
 
-		if !bp.Disabled {
-			t.Fatalf(
-				"Hit condition %s is no more satisfiable but breakpoint has not been disabled",
-				bp.HitCond,
-			)
+		if len(bp.Addrs) != 0 {
+			t.Fatalf("Hit condition %s is no longer satisfiable but breakpoint has not been disabled", bp.HitCond)
 		}
 	})
 }
@@ -697,17 +677,19 @@ func TestClientServer_disableHitEQLCondBreakpoint(t *testing.T) {
 			Line:    7,
 			HitCond: "== 3",
 		})
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
+		assertNoError(err, t, "CreateBreakpoint")
+		bp, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 8})
+		assertNoError(err, t, "CreateBreakpoint")
+
+		if len(bp.Addrs) == 0 {
+			t.Fatalf("no addresses for breakpoint")
 		}
 
 		state := <-c.Continue()
-		if state.Err != nil {
-			t.Fatalf("Unexpected error: %v, state: %#v", state.Err, state)
-		}
+		assertNoError(state.Err, t, "Continue")
 
 		f, l := state.CurrentThread.File, state.CurrentThread.Line
-		if f != "break.go" && l != 7 {
+		if f != fp || l != 7 {
 			t.Fatal("Program did not hit breakpoint")
 		}
 
@@ -720,14 +702,18 @@ func TestClientServer_disableHitEQLCondBreakpoint(t *testing.T) {
 			t.Fatalf("Wrong variable value: %s", ivar.Value)
 		}
 
-		bp, err := c.GetBreakpoint(hitCondBp.ID)
+		state = <-c.Continue()
+		assertNoError(state.Err, t, "Continue")
+
+		if state.CurrentThread.File != fp || state.CurrentThread.Line != 8 {
+			t.Fatal("Program did not hit breakpoint")
+		}
+
+		bp, err = c.GetBreakpoint(hitCondBp.ID)
 		assertNoError(err, t, "GetBreakpoint()")
 
-		if !bp.Disabled {
-			t.Fatalf(
-				"Hit condition %s is no more satisfiable but breakpoint has not been disabled",
-				bp.HitCond,
-			)
+		if len(bp.Addrs) != 0 {
+			t.Fatalf("Hit condition %s is no more satisfiable but breakpoint has not been disabled", bp.HitCond)
 		}
 	})
 }
@@ -3165,5 +3151,136 @@ func TestBreakpointVariablesWithoutG(t *testing.T) {
 		assertNoError(err, t, "CreateBreakpoint")
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
+	})
+}
+
+func TestGuessSubstitutePath(t *testing.T) {
+	t.Setenv("NOCERT", "1")
+	slashnorm := func(s string) string {
+		if runtime.GOOS != "windows" {
+			return s
+		}
+		return strings.ReplaceAll(s, "\\", "/")
+	}
+
+	guess := func(t *testing.T, goflags string) [][2]string {
+		oldgoflags := os.Getenv("GOFLAGS")
+		os.Setenv("GOFLAGS", goflags)
+		defer os.Setenv("GOFLAGS", oldgoflags)
+
+		dlvbin := protest.GetDlvBinary(t)
+
+		listener, clientConn := service.ListenerPipe()
+		defer listener.Close()
+		server := rpccommon.NewServer(&service.Config{
+			Listener:    listener,
+			ProcessArgs: []string{dlvbin, "help"},
+			Debugger: debugger.Config{
+				Backend:        testBackend,
+				CheckGoVersion: true,
+				BuildFlags:     "", // build flags can be an empty string here because the only test that uses it, does not set special flags.
+				ExecuteKind:    debugger.ExecutingExistingFile,
+			},
+		})
+		if err := server.Run(); err != nil {
+			t.Fatal(err)
+		}
+
+		client := rpc2.NewClientFromConn(clientConn)
+		defer client.Detach(true)
+
+		switch runtime.GOARCH {
+		case "ppc64le":
+			os.Setenv("GOFLAGS", "-tags=exp.linuxppc64le")
+		case "riscv64":
+			os.Setenv("GOFLAGS", "-tags=exp.linuxriscv64")
+		}
+
+		gsp, err := client.GuessSubstitutePath()
+		assertNoError(err, t, "GuessSubstitutePath")
+		return gsp
+	}
+
+	delvePath := protest.ProjectRoot()
+	var nmods int = -1
+
+	t.Run("Normal", func(t *testing.T) {
+		gsp := guess(t, "")
+		t.Logf("Normal build: %d", len(gsp))
+		if len(gsp) == 0 {
+			t.Fatalf("not enough modules")
+		}
+		found := false
+		for _, e := range gsp {
+			t.Logf("\t%s -> %s", e[0], e[1])
+			if e[0] != slashnorm(e[1]) {
+				t.Fatalf("mismatch %q %q", e[0], e[1])
+			}
+			if e[1] == delvePath {
+				found = true
+			}
+		}
+		nmods = len(gsp)
+		if !found {
+			t.Fatalf("could not find main module path %q", delvePath)
+		}
+
+		if os.Getenv("CI") == "true" {
+			return
+		}
+	})
+
+	t.Run("Modules", func(t *testing.T) {
+		gsp := guess(t, "-mod=mod")
+		t.Logf("Modules build: %d", len(gsp))
+		if len(gsp) != nmods && nmods != -1 {
+			t.Fatalf("not enough modules")
+		}
+		found := false
+		for _, e := range gsp {
+			t.Logf("\t%s -> %s", e[0], e[1])
+			if e[0] == slashnorm(delvePath) && e[1] == delvePath {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("could not find main module path %q", delvePath)
+		}
+	})
+
+	t.Run("Trimpath", func(t *testing.T) {
+		gsp := guess(t, "-trimpath")
+		t.Logf("Trimpath build: %d", len(gsp))
+		if len(gsp) != nmods && nmods != -1 {
+			t.Fatalf("not enough modules")
+		}
+		found := false
+		for _, e := range gsp {
+			t.Logf("\t%s -> %s", e[0], e[1])
+			if e[0] == "github.com/go-delve/delve" && e[1] == delvePath {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("could not find main module path %q", delvePath)
+		}
+	})
+
+	t.Run("ModulesTrimpath", func(t *testing.T) {
+		gsp := guess(t, "-trimpath -mod=mod")
+		t.Logf("Modules+Trimpath build: %d", len(gsp))
+		if len(gsp) != nmods && nmods != -1 {
+			t.Fatalf("not enough modules")
+		}
+		found := false
+		for _, e := range gsp {
+			t.Logf("\t%s -> %s", e[0], e[1])
+			if e[0] == "github.com/go-delve/delve" && e[1] == delvePath {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("could not find main module path %q", delvePath)
+		}
 	})
 }

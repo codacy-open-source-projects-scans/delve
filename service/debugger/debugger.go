@@ -7,17 +7,15 @@ import (
 	"debug/pe"
 	"errors"
 	"fmt"
-	"go/parser"
-	"go/token"
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -767,10 +765,10 @@ func (d *Debugger) CreateBreakpoint(requestedBp *api.Breakpoint, locExpr string,
 		d.breakpointIDCounter = id
 	}
 
-	lbp := &proc.LogicalBreakpoint{LogicalID: id, HitCount: make(map[int64]uint64), Enabled: true}
+	lbp := &proc.LogicalBreakpoint{LogicalID: id, HitCount: make(map[int64]uint64)}
 	d.target.LogicalBreakpoints[id] = lbp
 
-	err = copyLogicalBreakpointInfo(lbp, requestedBp)
+	err = d.copyLogicalBreakpointInfo(lbp, requestedBp)
 	if err != nil {
 		return nil, err
 	}
@@ -789,7 +787,7 @@ func (d *Debugger) CreateBreakpoint(requestedBp *api.Breakpoint, locExpr string,
 		}
 	}
 
-	err = d.target.EnableBreakpoint(lbp)
+	err = d.target.SetBreakpointEnabled(lbp, true)
 	if err != nil {
 		if suspended {
 			logflags.DebuggerLogger().Debugf("could not enable new breakpoint: %v (breakpoint will be suspended)", err)
@@ -846,34 +844,18 @@ func (d *Debugger) amendBreakpoint(amend *api.Breakpoint) error {
 	if original == nil {
 		return fmt.Errorf("no breakpoint with ID %d", amend.ID)
 	}
-	enabledBefore := original.Enabled
-	err := copyLogicalBreakpointInfo(original, amend)
+	if d.isWatchpoint(original) && amend.Disabled {
+		return errors.New("can not disable watchpoints")
+	}
+	err := d.copyLogicalBreakpointInfo(original, amend)
 	if err != nil {
 		return err
 	}
-	original.Enabled = !amend.Disabled
-
-	switch {
-	case enabledBefore && !original.Enabled:
-		if d.isWatchpoint(original) {
-			return errors.New("can not disable watchpoints")
-		}
-		err = d.target.DisableBreakpoint(original)
-	case !enabledBefore && original.Enabled:
-		err = d.target.EnableBreakpoint(original)
-	}
+	err = d.target.SetBreakpointEnabled(original, !amend.Disabled)
 	if err != nil {
 		return err
 	}
 
-	t := proc.ValidTargets{Group: d.target}
-	for t.Next() {
-		for _, bp := range t.Breakpoints().M {
-			if bp.LogicalID() == amend.ID {
-				bp.UserBreaklet().Cond = original.Cond
-			}
-		}
-	}
 	return nil
 }
 
@@ -906,7 +888,7 @@ func (d *Debugger) CancelNext() error {
 	return d.target.ClearSteppingBreakpoints()
 }
 
-func copyLogicalBreakpointInfo(lbp *proc.LogicalBreakpoint, requested *api.Breakpoint) error {
+func (d *Debugger) copyLogicalBreakpointInfo(lbp *proc.LogicalBreakpoint, requested *api.Breakpoint) error {
 	lbp.Name = requested.Name
 	lbp.Tracepoint = requested.Tracepoint
 	lbp.TraceReturn = requested.TraceReturn
@@ -918,70 +900,8 @@ func copyLogicalBreakpointInfo(lbp *proc.LogicalBreakpoint, requested *api.Break
 	lbp.UserData = requested.UserData
 	lbp.RootFuncName = requested.RootFuncName
 	lbp.TraceFollowCalls = requested.TraceFollowCalls
-	lbp.Cond = nil
-	if requested.Cond != "" {
-		var err error
-		lbp.Cond, err = parser.ParseExpr(requested.Cond)
-		if err != nil {
-			return err
-		}
-	}
 
-	lbp.HitCond = nil
-	if requested.HitCond != "" {
-		opTok, val, err := parseHitCondition(requested.HitCond)
-		if err != nil {
-			return err
-		}
-		lbp.HitCond = &struct {
-			Op  token.Token
-			Val int
-		}{opTok, val}
-		lbp.HitCondPerG = requested.HitCondPerG
-	}
-
-	return nil
-}
-
-func parseHitCondition(hitCond string) (token.Token, int, error) {
-	// A hit condition can be in the following formats:
-	// - "number"
-	// - "OP number"
-	hitConditionRegex := regexp.MustCompile(`(([=><%!])+|)( |)((\d|_)+)`)
-
-	match := hitConditionRegex.FindStringSubmatch(strings.TrimSpace(hitCond))
-	if match == nil || len(match) != 6 {
-		return 0, 0, fmt.Errorf("unable to parse breakpoint hit condition: %q\nhit conditions should be of the form \"number\" or \"OP number\"", hitCond)
-	}
-
-	opStr := match[1]
-	var opTok token.Token
-	switch opStr {
-	case "==", "":
-		opTok = token.EQL
-	case ">=":
-		opTok = token.GEQ
-	case "<=":
-		opTok = token.LEQ
-	case ">":
-		opTok = token.GTR
-	case "<":
-		opTok = token.LSS
-	case "%":
-		opTok = token.REM
-	case "!=":
-		opTok = token.NEQ
-	default:
-		return 0, 0, fmt.Errorf("unable to parse breakpoint hit condition: %q\ninvalid operator: %q", hitCond, opStr)
-	}
-
-	numStr := match[4]
-	val, parseErr := strconv.Atoi(numStr)
-	if parseErr != nil {
-		return 0, 0, fmt.Errorf("unable to parse breakpoint hit condition: %q\ninvalid number: %q", hitCond, numStr)
-	}
-
-	return opTok, val, nil
+	return d.target.ChangeBreakpointCondition(lbp, requested.Cond, requested.HitCond, requested.HitCondPerG)
 }
 
 // ClearBreakpoint clears a breakpoint.
@@ -999,7 +919,7 @@ func (d *Debugger) ClearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint
 	lbp := d.target.LogicalBreakpoints[requestedBp.ID]
 	clearedBp := d.convertBreakpoint(lbp)
 
-	err := d.target.DisableBreakpoint(lbp)
+	err := d.target.SetBreakpointEnabled(lbp, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1008,33 +928,6 @@ func (d *Debugger) ClearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint
 
 	d.log.Infof("cleared breakpoint: %#v", clearedBp)
 	return clearedBp, nil
-}
-
-// isBpHitCondNotSatisfiable returns true if the breakpoint bp has a hit
-// condition that is no more satisfiable.
-// The hit condition is considered no more satisfiable if it can no longer be
-// hit again, for example with {Op: "==", Val: 1} and TotalHitCount == 1.
-func isBpHitCondNotSatisfiable(bp *api.Breakpoint) bool {
-	if bp.HitCond == "" {
-		return false
-	}
-
-	tok, val, err := parseHitCondition(bp.HitCond)
-	if err != nil {
-		return false
-	}
-	switch tok {
-	case token.EQL, token.LEQ:
-		if int(bp.TotalHitCount) >= val {
-			return true
-		}
-	case token.LSS:
-		if int(bp.TotalHitCount) >= val-1 {
-			return true
-		}
-	}
-
-	return false
 }
 
 // Breakpoints returns the list of current breakpoints.
@@ -1318,6 +1211,7 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
 			state.Exited = true
 			state.ExitStatus = errProcessExited.Status
 			state.Err = errProcessExited
+			d.maybePrintUnattendedStopWarning(proc.StopExited, state.CurrentThread, clientStatusCh)
 			return state, nil
 		}
 		return nil, err
@@ -1335,12 +1229,8 @@ func (d *Debugger) Command(command *api.DebuggerCommand, resumeNotify chan struc
 			}
 		}
 	}
-	if bp := state.CurrentThread.Breakpoint; bp != nil && isBpHitCondNotSatisfiable(bp) {
-		bp.Disabled = true
-		d.amendBreakpoint(bp)
-	}
 
-	d.maybePrintUnattendedBreakpointWarning(d.target.Selected.StopReason, state.CurrentThread, clientStatusCh)
+	d.maybePrintUnattendedStopWarning(d.target.Selected.StopReason, state.CurrentThread, clientStatusCh)
 	return state, err
 }
 
@@ -1936,7 +1826,6 @@ func (d *Debugger) convertStacktrace(rawlocs []proc.Stackframe, cfg *proc.LoadCo
 			frame.Err = rawlocs[i].Err.Error()
 		}
 		if cfg != nil && rawlocs[i].Current.Fn != nil {
-			var err error
 			scope := proc.FrameToScope(d.target.Selected, d.target.Selected.Memory(), nil, 0, rawlocs[i:]...)
 			locals, err := scope.LocalVariables(*cfg)
 			if err != nil {
@@ -2498,13 +2387,24 @@ func attachErrorMessageDefault(pid int, err error) error {
 	return fmt.Errorf("could not attach to pid %d: %s", pid, err)
 }
 
-func (d *Debugger) maybePrintUnattendedBreakpointWarning(stopReason proc.StopReason, currentThread *api.Thread, clientStatusCh <-chan struct{}) {
+func (d *Debugger) maybePrintUnattendedStopWarning(stopReason proc.StopReason, currentThread *api.Thread, clientStatusCh <-chan struct{}) {
 	select {
 	case <-clientStatusCh:
 		// the channel will be closed if the client that sends the command has left
 		// i.e. closed the connection.
 	default:
 		return
+	}
+
+	if currentThread == nil || currentThread.Breakpoint == nil {
+		switch stopReason {
+		case proc.StopManual:
+			// print nothing
+			return
+		default:
+			fmt.Fprintln(os.Stderr, "Stop reason: "+stopReason.String())
+			return
+		}
 	}
 
 	const defaultStackTraceDepth = 50
@@ -2521,17 +2421,6 @@ func (d *Debugger) maybePrintUnattendedBreakpointWarning(stopReason proc.StopRea
 	}
 
 	bp := currentThread.Breakpoint
-	if bp == nil {
-		switch stopReason {
-		case proc.StopManual:
-			// print nothing
-			return
-		default:
-			fmt.Fprintln(os.Stderr, "Stop reason: "+stopReason.String())
-			return
-		}
-	}
-
 	switch bp.Name {
 	case proc.FatalThrow, proc.UnrecoveredPanic:
 		fmt.Fprintln(os.Stderr, "\n** execution is paused because your program is panicking **")
@@ -2550,4 +2439,158 @@ func (d *Debugger) maybePrintUnattendedBreakpointWarning(stopReason proc.StopRea
 		return true
 	}
 	api.PrintStack(formatPathFunc, os.Stderr, apiFrames, "", false, api.StackTraceColors{}, includeFunc)
+}
+
+// GuessSubstitutePath returns a substitute-path configuration that maps
+// server paths to client paths by examining the executable file and a map
+// of module paths to client directories (clientMod2Dir) passed as input.
+func (d *Debugger) GuessSubstitutePath(args *api.GuessSubstitutePathIn) map[string]string {
+	bis := []*proc.BinaryInfo{}
+	bins := [][]proc.Function{}
+	tgt := proc.ValidTargets{Group: d.target}
+	for tgt.Next() {
+		bi := tgt.BinInfo()
+		bis = append(bis, bi)
+		bins = append(bins, bi.Functions)
+	}
+	return guessSubstitutePath(args, bins, func(biIdx int, fn *proc.Function) string {
+		file, _ := bis[biIdx].EntryLineForFunc(fn)
+		return file
+	})
+}
+
+func guessSubstitutePath(args *api.GuessSubstitutePathIn, bins [][]proc.Function, fileForFunc func(int, *proc.Function) string) map[string]string {
+	serverMod2Dir := map[string]string{}
+	serverMod2DirCandidate := map[string]map[string]int{}
+	pkg2mod := map[string]string{}
+
+	for mod := range args.ClientModuleDirectories {
+		serverMod2DirCandidate[mod] = make(map[string]int)
+	}
+
+	const minEvidence = 10
+	const decisionThreshold = 0.8
+
+	totCandidates := func(mod string) int {
+		r := 0
+		for _, cnt := range serverMod2DirCandidate[mod] {
+			r += cnt
+		}
+		return r
+	}
+
+	bestCandidate := func(mod string) string {
+		best := ""
+		for dir, cnt := range serverMod2DirCandidate[mod] {
+			if cnt > serverMod2DirCandidate[mod][best] {
+				best = dir
+			}
+		}
+		return best
+	}
+
+	slashes := func(s string) int {
+		r := 0
+		for _, ch := range s {
+			if ch == '/' {
+				r++
+			}
+		}
+		return r
+	}
+
+	serverGoroot := ""
+
+	logger := logflags.DebuggerLogger()
+
+	for binIdx, bin := range bins {
+		for i := range bin {
+			fn := &bin[i]
+
+			if fn.Name == "runtime.main" && serverGoroot == "" {
+				file := fileForFunc(binIdx, fn)
+				serverGoroot = path.Dir(path.Dir(path.Dir(file)))
+				continue
+			}
+
+			fnpkg := fn.PackageName()
+			if fn.CompilationUnitName() != "" && strings.ReplaceAll(fn.CompilationUnitName(), "\\", "/") != fnpkg {
+				// inlined
+				continue
+			}
+
+			if fnpkg == "main" && binIdx == 0 && args.ImportPathOfMainPackage != "" {
+				fnpkg = args.ImportPathOfMainPackage
+			}
+
+			fnmod := ""
+
+			if mod, ok := pkg2mod[fnpkg]; ok {
+				fnmod = mod
+			} else {
+				for mod := range args.ClientModuleDirectories {
+					if strings.HasPrefix(fnpkg, mod) {
+						fnmod = mod
+						break
+					}
+				}
+				pkg2mod[fnpkg] = fnmod
+				if fnmod == "" {
+					logger.Debugf("No module detected for server package %q", fnpkg)
+				}
+			}
+
+			if fnmod == "" {
+				// not in any module we are interested in
+				continue
+			}
+			if serverMod2Dir[fnmod] != "" {
+				// already decided
+				continue
+			}
+
+			elems := slashes(fnpkg[len(fnmod):])
+
+			file := fileForFunc(binIdx, fn)
+			if file == "" || file == "<autogenerated>" {
+				continue
+			}
+			logger.Debugf("considering %s pkg:%s compile unit:%s file:%s", fn.Name, fnpkg, fn.CompilationUnitName(), file)
+			dir := path.Dir(file) // note: paths are normalized to always use '/' as a separator by pkg/dwarf/line
+			if slashes(dir) < elems {
+				continue
+			}
+			for i := 0; i < elems; i++ {
+				dir = path.Dir(dir)
+			}
+
+			serverMod2DirCandidate[fnmod][dir]++
+
+			n := totCandidates(fnmod)
+			best := bestCandidate(fnmod)
+			if n > minEvidence && float64(serverMod2DirCandidate[fnmod][best])/float64(n) > decisionThreshold {
+				serverMod2Dir[fnmod] = best
+			}
+		}
+	}
+
+	for mod := range args.ClientModuleDirectories {
+		if serverMod2Dir[mod] == "" {
+			serverMod2Dir[mod] = bestCandidate(mod)
+		}
+	}
+
+	server2Client := make(map[string]string)
+
+	for mod, clientDir := range args.ClientModuleDirectories {
+		if serverMod2Dir[mod] != "" {
+			server2Client[serverMod2Dir[mod]] = clientDir
+		}
+	}
+
+	if serverGoroot != "" && args.ClientGOROOT != "" {
+		server2Client[serverGoroot] = args.ClientGOROOT
+	}
+
+	return server2Client
 }

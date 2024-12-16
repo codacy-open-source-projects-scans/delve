@@ -201,7 +201,6 @@ func (s *RPCServer) Stacktrace(arg StacktraceIn, out *StacktraceOut) error {
 	if arg.Defers {
 		arg.Opts |= api.StacktraceReadDefers
 	}
-	var err error
 	rawlocs, err := s.debugger.Stacktrace(arg.Id, arg.Depth, arg.Opts)
 	if err != nil {
 		return err
@@ -781,7 +780,6 @@ type DisassembleOut struct {
 //
 // Disassemble will also try to calculate the destination address of an absolute indirect CALL if it happens to be the instruction the selected goroutine is stopped at.
 func (s *RPCServer) Disassemble(arg DisassembleIn, out *DisassembleOut) error {
-	var err error
 	insts, err := s.debugger.Disassemble(arg.Scope.GoroutineID, arg.StartPC, arg.EndPC)
 	if err != nil {
 		return err
@@ -828,7 +826,6 @@ type ListCheckpointsOut struct {
 }
 
 func (s *RPCServer) ListCheckpoints(arg ListCheckpointsIn, out *ListCheckpointsOut) error {
-	var err error
 	cps, err := s.debugger.Checkpoints()
 	if err != nil {
 		return err
@@ -981,7 +978,7 @@ const ExamineMemoryLengthLimit = 1 << 16
 
 func (s *RPCServer) ExamineMemory(arg ExamineMemoryIn, out *ExaminedMemoryOut) error {
 	if arg.Length > ExamineMemoryLengthLimit {
-		return errors.New("len must be less than or equal to 1000")
+		return fmt.Errorf("len must be less than or equal to %d", ExamineMemoryLengthLimit)
 	}
 	Mem, err := s.debugger.ExamineMemory(arg.Address, arg.Length)
 	if err != nil {
@@ -1144,5 +1141,21 @@ func (s *RPCServer) DebugInfoDirectories(arg DebugInfoDirectoriesIn, out *DebugI
 		s.debugger.SetDebugInfoDirectories(arg.List)
 	}
 	out.List = s.debugger.DebugInfoDirectories()
+	return nil
+}
+
+type GuessSubstitutePathIn struct {
+	Args api.GuessSubstitutePathIn
+}
+
+type GuessSubstitutePathOut struct {
+	List [][2]string
+}
+
+func (s *RPCServer) GuessSubstitutePath(arg GuessSubstitutePathIn, out *GuessSubstitutePathOut) error {
+	m := s.debugger.GuessSubstitutePath(&arg.Args)
+	for k, v := range m {
+		out.List = append(out.List, [2]string{k, v})
+	}
 	return nil
 }

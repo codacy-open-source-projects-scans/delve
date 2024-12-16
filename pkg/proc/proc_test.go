@@ -58,7 +58,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	logflags.Setup(logConf != "", logConf, "")
-	os.Exit(protest.RunTestsWithFixtures(m))
+	protest.RunTestsWithFixtures(m)
 }
 
 func matchSkipConditions(conditions ...string) bool {
@@ -1540,10 +1540,7 @@ func TestCondBreakpointError(t *testing.T) {
 func TestHitCondBreakpointEQ(t *testing.T) {
 	withTestProcess("break", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 7)
-		bp.Logical.HitCond = &struct {
-			Op  token.Token
-			Val int
-		}{token.EQL, 3}
+		grp.ChangeBreakpointCondition(bp.Logical, "", "== 3", false)
 
 		assertNoError(grp.Continue(), t, "Continue()")
 		ivar := evalVariable(p, t, "i")
@@ -1564,10 +1561,7 @@ func TestHitCondBreakpointGEQ(t *testing.T) {
 	protest.AllowRecording(t)
 	withTestProcess("break", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 7)
-		bp.Logical.HitCond = &struct {
-			Op  token.Token
-			Val int
-		}{token.GEQ, 3}
+		grp.ChangeBreakpointCondition(bp.Logical, "", ">= 3", false)
 
 		for it := 3; it <= 10; it++ {
 			assertNoError(grp.Continue(), t, "Continue()")
@@ -1587,10 +1581,7 @@ func TestHitCondBreakpointREM(t *testing.T) {
 	protest.AllowRecording(t)
 	withTestProcess("break", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 7)
-		bp.Logical.HitCond = &struct {
-			Op  token.Token
-			Val int
-		}{token.REM, 2}
+		grp.ChangeBreakpointCondition(bp.Logical, "", "% 2", false)
 
 		for it := 2; it <= 10; it += 2 {
 			assertNoError(grp.Continue(), t, "Continue()")
@@ -5123,8 +5114,9 @@ func TestFollowExec(t *testing.T) {
 		grp.LogicalBreakpoints[2] = &proc.LogicalBreakpoint{LogicalID: 2, Set: proc.SetBreakpoint{FunctionName: "main.traceme2"}, HitCount: make(map[int64]uint64)}
 		grp.LogicalBreakpoints[3] = &proc.LogicalBreakpoint{LogicalID: 3, Set: proc.SetBreakpoint{FunctionName: "main.traceme3"}, HitCount: make(map[int64]uint64)}
 
-		assertNoError(grp.EnableBreakpoint(grp.LogicalBreakpoints[1]), t, "EnableBreakpoint(main.traceme1)")
-		assertNoError(grp.EnableBreakpoint(grp.LogicalBreakpoints[3]), t, "EnableBreakpoint(main.traceme3)")
+		assertNoError(grp.SetBreakpointEnabled(grp.LogicalBreakpoints[1], true), t, "EnableBreakpoint(main.traceme1)")
+		assertNoError(grp.SetBreakpointEnabled(grp.LogicalBreakpoints[2], true), t, "EnableBreakpoint(main.traceme2)")
+		assertNoError(grp.SetBreakpointEnabled(grp.LogicalBreakpoints[3], true), t, "EnableBreakpoint(main.traceme3)")
 
 		assertNoError(grp.FollowExec(true, ""), t, "FollowExec")
 
@@ -5297,8 +5289,9 @@ func TestFollowExecRegexFilter(t *testing.T) {
 		grp.LogicalBreakpoints[2] = &proc.LogicalBreakpoint{LogicalID: 2, Set: proc.SetBreakpoint{FunctionName: "main.traceme2"}, HitCount: make(map[int64]uint64)}
 		grp.LogicalBreakpoints[3] = &proc.LogicalBreakpoint{LogicalID: 3, Set: proc.SetBreakpoint{FunctionName: "main.traceme3"}, HitCount: make(map[int64]uint64)}
 
-		assertNoError(grp.EnableBreakpoint(grp.LogicalBreakpoints[1]), t, "EnableBreakpoint(main.traceme1)")
-		assertNoError(grp.EnableBreakpoint(grp.LogicalBreakpoints[3]), t, "EnableBreakpoint(main.traceme3)")
+		assertNoError(grp.SetBreakpointEnabled(grp.LogicalBreakpoints[1], true), t, "EnableBreakpoint(main.traceme1)")
+		assertNoError(grp.SetBreakpointEnabled(grp.LogicalBreakpoints[2], true), t, "EnableBreakpoint(main.traceme2)")
+		assertNoError(grp.SetBreakpointEnabled(grp.LogicalBreakpoints[3], true), t, "EnableBreakpoint(main.traceme3)")
 
 		assertNoError(grp.FollowExec(true, "spawn.* child C1"), t, "FollowExec")
 
@@ -5479,28 +5472,30 @@ func TestReadClosure(t *testing.T) {
 			accV := evalVariable(p, t, "acc")
 			t.Log(api.ConvertVar(accV).MultilineString("", ""))
 			if len(accV.Children) != 2 {
-				t.Error("wrong number of children")
-			} else {
-				found := 0
-				for j := range accV.Children {
-					v := &accV.Children[j]
-					switch v.Name {
-					case "scale":
-						found++
-						if val, _ := constant.Int64Val(v.Value); val != 3 {
-							t.Error("wrong value for scale")
-						}
-					case "a":
-						found++
-						if val, _ := constant.Int64Val(v.Value); val != avalues[i] {
-							t.Errorf("wrong value for a: %d", val)
-						}
+				t.Fatal("wrong number of children")
+			}
+			found := 0
+			for j := range accV.Children {
+				v := &accV.Children[j]
+				switch v.Name {
+				case "scale":
+					found++
+					if val, _ := constant.Int64Val(v.Value); val != 3 {
+						t.Error("wrong value for scale")
+					}
+				case "a":
+					found++
+					if val, _ := constant.Int64Val(v.Value); val != avalues[i] {
+						t.Errorf("wrong value for a: %d", val)
 					}
 				}
-				if found != 2 {
-					t.Error("wrong captured variables")
-				}
 			}
+			if found != 2 {
+				t.Error("wrong captured variables")
+			}
+
+			assertVariable(t, evalVariable(p, t, "acc.scale"), varTest{name: "acc.scale", preserveName: true, value: "3", varType: "int"})
+			assertVariable(t, evalVariable(p, t, "acc.a"), varTest{name: "acc.a", preserveName: true, value: fmt.Sprintf("%d", avalues[i]), varType: "int"})
 		}
 	})
 }
