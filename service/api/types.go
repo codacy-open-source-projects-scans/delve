@@ -118,6 +118,8 @@ type Breakpoint struct {
 	LoadArgs *LoadConfig
 	// LoadLocals requests loading function locals when the breakpoint is hit
 	LoadLocals *LoadConfig
+	// CustomCommands are custom starlark commands to execute when the breakpoint is hit
+	CustomCommands []string `json:"customCommands,omitempty"`
 
 	// WatchExpr is the expression used to create this watchpoint
 	WatchExpr string
@@ -132,7 +134,7 @@ type Breakpoint struct {
 	// Disabled flag, signifying the state of the breakpoint
 	Disabled bool `json:"disabled"`
 
-	UserData interface{} `json:"-"`
+	UserData any `json:"-"`
 
 	// RootFuncName is the Root function from where tracing needs to be done
 	RootFuncName string
@@ -411,6 +413,10 @@ type DebuggerCommand struct {
 	// Expr is the expression argument for a Call command
 	Expr string `json:"expr,omitempty"`
 
+	// If WithEvents is set events are generated that should be read by calling
+	// GetEvents.
+	WithEvents bool
+
 	// UnsafeCall disables parameter escape checking for function calls.
 	// Go objects can be allocated on the stack or on the heap. Heap objects
 	// can be used by any goroutine; stack objects can only be used by the
@@ -683,4 +689,30 @@ type GuessSubstitutePathIn struct {
 	ImportPathOfMainPackage string
 	ClientGOROOT            string
 	ClientModuleDirectories map[string]string
+}
+
+// Event is an event that happened during execution of the debugged program.
+type Event struct {
+	Kind EventKind
+	*BinaryInfoDownloadEventDetails
+	*BreakpointMaterializedEventDetails
+}
+
+type EventKind uint8
+
+const (
+	EventResumed EventKind = iota
+	EventStopped
+	EventBinaryInfoDownload
+	EventBreakpointMaterialized
+)
+
+// BinaryInfoDownloadEventDetails describes the details of a BinaryInfoDownloadEvent
+type BinaryInfoDownloadEventDetails struct {
+	ImagePath, Progress string
+}
+
+// BreakpointMaterializedEventDetails describes the details of a BreakpointMaterializedEvent
+type BreakpointMaterializedEventDetails struct {
+	Breakpoint *Breakpoint
 }

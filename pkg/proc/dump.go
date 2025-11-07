@@ -140,6 +140,8 @@ func (t *Target) Dump(out elfwriter.WriteCloserSeeker, flags DumpFlags, state *D
 		fhdr.Machine = elf.EM_PPC64
 	case "riscv64":
 		fhdr.Machine = elf.EM_RISCV
+	case "loong64":
+		fhdr.Machine = elf.EM_LOONGARCH
 	default:
 		panic("not implemented")
 	}
@@ -159,7 +161,7 @@ func (t *Target) Dump(out elfwriter.WriteCloserSeeker, flags DumpFlags, state *D
 	notes = append(notes, elfwriter.Note{
 		Type: elfwriter.DelveHeaderNoteType,
 		Name: "Delve Header",
-		Data: []byte(fmt.Sprintf("%s/%s\n%s\n%s%d\n%s%#x\n", bi.GOOS, bi.Arch.Name, version.DelveVersion.String(), elfwriter.DelveHeaderTargetPidPrefix, t.pid, elfwriter.DelveHeaderEntryPointPrefix, entryPoint)),
+		Data: fmt.Appendf(nil, "%s/%s\n%s\n%s%d\n%s%#x\n", bi.GOOS, bi.Arch.Name, version.DelveVersion.String(), elfwriter.DelveHeaderTargetPidPrefix, t.pid, elfwriter.DelveHeaderEntryPointPrefix, entryPoint),
 	})
 
 	threads := t.ThreadList()
@@ -386,7 +388,7 @@ func (t *Target) shouldDumpMemory(mme *MemoryMapEntry) bool {
 }
 
 type internalError struct {
-	Err   interface{}
+	Err   any
 	Stack []internalErrorFrame
 }
 
@@ -397,7 +399,7 @@ type internalErrorFrame struct {
 	Line int
 }
 
-func newInternalError(ierr interface{}, skip int) *internalError {
+func newInternalError(ierr any, skip int) *internalError {
 	r := &internalError{ierr, nil}
 	for i := skip; ; i++ {
 		pc, file, line, ok := runtime.Caller(i)

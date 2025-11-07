@@ -13,10 +13,11 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/derekparker/trie"
+	"github.com/derekparker/trie/v3"
 	"github.com/go-delve/liner"
 
 	"github.com/go-delve/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/locspec"
 	"github.com/go-delve/delve/pkg/terminal/colorize"
 	"github.com/go-delve/delve/pkg/terminal/starbind"
@@ -80,6 +81,13 @@ type Term struct {
 	quitting      bool
 
 	traceNonInteractive bool
+
+	downloadsMu         sync.Mutex
+	downloadsInProgress bool
+
+	goVersionCache *goversion.GoVersion
+	// customCommandsInvalidated is set when a runCmd is executed during custom command execution
+	customCommandsInvalidated []bool
 }
 
 type displayEntry struct {
@@ -122,6 +130,40 @@ func New(client service.Client, conf *config.Config) *Term {
 		if state, err := client.GetState(); err == nil {
 			t.oldPid = state.Pid
 		}
+		firstEventBinaryInfoDownload := true
+		client.SetEventsFn(func(event *api.Event) {
+			switch event.Kind {
+			case api.EventResumed:
+				firstEventBinaryInfoDownload = true
+			case api.EventBinaryInfoDownload:
+				t.downloadsMu.Lock()
+				t.downloadsInProgress = true
+				t.downloadsMu.Unlock()
+				if !firstEventBinaryInfoDownload {
+					fmt.Fprintf(t.stdout, "\r")
+				}
+				fmt.Fprintf(t.stdout, "Downloading debug info for %s: %s (press ^C to cancel)", event.BinaryInfoDownloadEventDetails.ImagePath, event.BinaryInfoDownloadEventDetails.Progress)
+				firstEventBinaryInfoDownload = false
+			case api.EventStopped:
+				t.downloadsMu.Lock()
+				t.downloadsInProgress = false
+				t.downloadsMu.Unlock()
+				if !firstEventBinaryInfoDownload {
+					fmt.Fprintf(t.stdout, "\n")
+				}
+			case api.EventBreakpointMaterialized:
+				bp := event.BreakpointMaterializedEventDetails.Breakpoint
+				file := t.formatPath(bp.File)
+
+				// Append the function name.
+				var extra string
+				if bp.FunctionName != "" {
+					extra = " (" + bp.FunctionName + ")"
+				}
+
+				fmt.Fprintf(t.stdout, "Breakpoint %d materialized at %s:%d%s\n", bp.ID, file, bp.Line, extra)
+			}
+		})
 	}
 
 	t.starlarkEnv = starbind.New(starlarkContext{t}, t.stdout)
@@ -198,6 +240,14 @@ func (t *Term) Close() {
 
 func (t *Term) sigintGuard(ch <-chan os.Signal, multiClient bool) {
 	for range ch {
+		t.downloadsMu.Lock()
+		downloadsInProgress := t.downloadsInProgress
+		t.downloadsMu.Unlock()
+		if downloadsInProgress {
+			t.client.CancelDownloads()
+			continue
+		}
+
 		t.longCommandCancel()
 		t.starlarkEnv.Cancel()
 		state, err := t.client.GetStateNonBlocking()
@@ -264,19 +314,15 @@ func (t *Term) Run() (int, error) {
 	signal.Notify(ch, syscall.SIGINT)
 	go t.sigintGuard(ch, multiClient)
 
-	fns := trie.New()
-	cmds := trie.New()
-	funcs, _ := t.client.ListFunctions("", 0)
-	for _, fn := range funcs {
-		fns.Add(fn, nil)
-	}
+	cmds := trie.New[any]()
 	for _, cmd := range t.cmds.cmds {
 		for _, alias := range cmd.aliases {
 			cmds.Add(alias, nil)
 		}
 	}
 
-	var locs *trie.Trie
+	var fns *trie.Trie[any]
+	var locs *trie.Trie[any]
 
 	t.line.SetCompleter(func(line string) (c []string) {
 		cmd := t.cmds.Find(strings.Split(line, " ")[0], noPrefix)
@@ -284,6 +330,13 @@ func (t *Term) Run() (int, error) {
 		case "break", "trace", "continue":
 			if spc := strings.LastIndex(line, " "); spc > 0 {
 				prefix := line[:spc] + " "
+				if fns == nil {
+					fns = trie.New[any]()
+					funcs, _ := t.client.ListFunctions("", 0)
+					for _, fn := range funcs {
+						fns.Add(fn, nil)
+					}
+				}
 				funcs := fns.FuzzySearch(line[spc+1:])
 				for _, f := range funcs {
 					c = append(c, prefix+f)
@@ -303,7 +356,7 @@ func (t *Term) Run() (int, error) {
 					break
 				}
 
-				locs = trie.New()
+				locs = trie.New[any]()
 				for _, loc := range localVars {
 					locs.Add(loc.Name, nil)
 				}
@@ -453,7 +506,7 @@ func (t *Term) promptForInput() (string, error) {
 	return l, nil
 }
 
-func yesno(line *liner.State, question, defaultAnswer string) (bool, error) {
+var yesno = func(line *liner.State, question, defaultAnswer string) (bool, error) {
 	for {
 		answer, err := line.Prompt(question)
 		if err != nil {
@@ -603,6 +656,7 @@ func (t *Term) printDisplays() {
 
 func (t *Term) onStop() {
 	t.printDisplays()
+	t.cmds.executeBreakpointCustomCommands(t)
 }
 
 func (t *Term) longCommandCancel() {
@@ -626,6 +680,16 @@ func (t *Term) longCommandCanceled() bool {
 // RedirectTo redirects the output of this terminal to the specified writer.
 func (t *Term) RedirectTo(w io.Writer) {
 	t.stdout.pw.w = w
+}
+
+func (t *Term) goVersion() *goversion.GoVersion {
+	if t.goVersionCache != nil {
+		return t.goVersionCache
+	}
+	vers := t.client.GetVersion()
+	v, _ := goversion.Parse(vers.TargetGoVersion)
+	t.goVersionCache = &v
+	return t.goVersionCache
 }
 
 // isErrProcessExited returns true if `err` is an RPC error equivalent of proc.ErrProcessExited

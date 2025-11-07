@@ -7,6 +7,7 @@ package terminal
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"go/parser"
@@ -19,6 +20,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,12 +78,7 @@ type command struct {
 
 // Returns true if the command string matches one of the aliases for this command
 func (c command) match(cmdstr string) bool {
-	for _, v := range c.aliases {
-		if v == cmdstr {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.aliases, cmdstr)
 }
 
 // Commands represents the commands for Delve terminal process.
@@ -101,14 +98,6 @@ var (
 	// and limiting struct fields loaded to 3.
 	ShortLoadConfig = api.LoadConfig{MaxStringLen: 64, MaxStructFields: 3}
 )
-
-// byFirstAlias will sort by the first
-// alias of a command.
-type byFirstAlias []command
-
-func (a byFirstAlias) Len() int           { return len(a) }
-func (a byFirstAlias) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byFirstAlias) Less(i, j int) bool { return a[i].aliases[0] < a[j].aliases[0] }
 
 // DebugCommands returns a Commands struct with default commands defined.
 func DebugCommands(client service.Client) *Commands {
@@ -158,9 +147,9 @@ A tracepoint is a breakpoint that does not stop the execution of the program, in
 
 See also: "help on", "help cond" and "help clear"`},
 		{aliases: []string{"watch"}, group: breakCmds, cmdFn: watchpoint, helpMsg: `Set watchpoint.
-	
+
 	watch [-r|-w|-rw] <expr>
-	
+
 	-r	stops when the memory location is read
 	-w	stops when the memory location is written
 	-rw	stops when the memory location is read or written
@@ -182,7 +171,7 @@ For recorded targets the command takes the following forms:
 	restart					resets to the start of the recording
 	restart [checkpoint]			resets the recording to the given checkpoint
 	restart -r [newargv...]	[redirects...]	re-records the target process
-	
+
 For live targets the command takes the following forms:
 
 	restart [newargv...] [redirects...]	restarts the process
@@ -219,9 +208,9 @@ Optional [count] argument allows you to skip multiple lines.
 `},
 		{aliases: []string{"stepout", "so"}, group: runCmds, allowedPrefixes: revPrefix, cmdFn: c.stepout, helpMsg: "Step out of the current function."},
 		{aliases: []string{"call"}, group: runCmds, cmdFn: c.call, helpMsg: `Resumes process, injecting a function call (EXPERIMENTAL!!!)
-	
+
 	call [-unsafe] <function call expression>
-	
+
 Current limitations:
 - only pointers to stack-allocated objects can be passed as argument.
 - only some automatic type conversions are supported.
@@ -280,34 +269,34 @@ To only display goroutines where the specified location contains (or does not co
 	curloc: filter by the location of the topmost stackframe (including frames inside private runtime functions)
 	goloc: filter by the location of the go instruction that created the goroutine
 	startloc: filter by the location of the start function
-	
+
 To only display goroutines that have (or do not have) the specified label key and value, use:
 
 	goroutines -with label key=value
 	goroutines -without label key=value
-	
+
 To only display goroutines that have (or do not have) the specified label key, use:
 
 	goroutines -with label key
 	goroutines -without label key
-	
+
 To only display goroutines that are running (or are not running) on a OS thread, use:
 
 
 	goroutines -with running
 	goroutines -without running
-	
+
 To only display user (or runtime) goroutines, use:
 
 	goroutines -with user
 	goroutines -without user
 
 CHANNELS
-	
+
 To only show goroutines waiting to send to or receive from a specific channel use:
 
 	goroutines -chan expr
-	
+
 Note that 'expr' must not contain spaces.
 
 GROUPING
@@ -320,7 +309,7 @@ GROUPING
 	goloc: groups goroutines by the location of the go instruction that created the goroutine
 	startloc: groups goroutines by the location of the start function
 	running: groups goroutines by whether they are running or not
-	user: groups goroutines by weather they are user or runtime goroutines
+	user: groups goroutines by whether they are user or runtime goroutines
 
 
 Groups goroutines by the given location, running status or user classification, up to 5 goroutines per group will be displayed as well as the total number of goroutines in the group.
@@ -345,7 +334,7 @@ Called without arguments it will show information about the current goroutine.
 Called with a single argument it will switch to the specified goroutine.
 Called with more arguments it will execute a command on the specified goroutine.`},
 		{aliases: []string{"breakpoints", "bp"}, group: breakCmds, cmdFn: breakpoints, helpMsg: `Print out info for active breakpoints.
-	
+
 	breakpoints [-a]
 
 Specifying -a prints all physical breakpoint, including internal breakpoints.`},
@@ -407,9 +396,9 @@ If regex is specified only package variables with a name matching it will be ret
 
 Argument -a shows more registers. Individual registers can also be displayed by 'print' and 'display'. See Documentation/cli/expr.md.`},
 		{aliases: []string{"exit", "quit", "q"}, cmdFn: exitCommand, helpMsg: `Exit the debugger.
-		
+
 	exit [-c]
-	
+
 When connected to a headless instance started with the --accept-multiclient, pass -c to resume the execution of the target process before disconnecting.`},
 		{aliases: []string{"list", "ls", "l"}, cmdFn: listCommand, helpMsg: `Show source code.
 
@@ -479,7 +468,7 @@ Executes the specified command (print, args, locals) in the context of the n-th 
 		{aliases: []string{"source"}, cmdFn: c.sourceCommand, helpMsg: `Executes a file containing a list of delve commands
 
 	source <path>
-	
+
 If path ends with the .star extension it will be interpreted as a starlark script. See Documentation/cli/starlark.md for the syntax.
 
 If path is a single '-' character an interactive starlark interpreter will start instead. Type 'exit' to exit.`},
@@ -495,11 +484,14 @@ If no argument is specified the function being executed in the selected stack fr
 
 	on <breakpoint name or id> <command>
 	on <breakpoint name or id> -edit
-	
 
-Supported commands: print, stack, goroutine, trace and cond. 
+
+Supported commands: print, stack, goroutine, trace and cond.
+
+All custom starlark commands can also be used with the 'on' prefix. See Documentation/cli/starlark.md for more information.
+
 To convert a breakpoint into a tracepoint use:
-	
+
 	on <breakpoint name or id> trace
 
 The command 'on <bp> cond <cond-arguments>' is equivalent to 'cond <bp> <cond-arguments>'.
@@ -514,7 +506,7 @@ The command 'on x -edit' can be used to edit the list of commands executed when 
 
 Specifies that the breakpoint, tracepoint or watchpoint should break only if the boolean expression is true.
 
-See Documentation/cli/expr.md for a description of supported expressions.
+See Documentation/cli/expr.md for a description of supported expressions and Documentation/cli/cond.md for a description of how breakpoint conditions are evaluated.
 
 With the -hitcount option a condition on the breakpoint hit count can be set, the following operators are supported
 
@@ -529,7 +521,7 @@ With the -hitcount option a condition on the breakpoint hit count can be set, th
 The -per-g-hitcount option works like -hitcount, but use per goroutine hitcount to compare with n.
 
 With the -clear option a condition on the breakpoint can removed.
-	
+
 The '% n' form means we should stop at the breakpoint when the hitcount is a multiple of n.
 
 Examples:
@@ -578,9 +570,13 @@ Adds, removes or clears debug-info-directories.`},
 		{aliases: []string{"edit", "ed"}, cmdFn: edit, helpMsg: `Open where you are in $DELVE_EDITOR or $EDITOR
 
 	edit [locspec]
-	
+
 If locspec is omitted edit will open the current source file in the editor, otherwise it will open the specified location.`},
-		{aliases: []string{"libraries"}, cmdFn: libraries, helpMsg: `List loaded dynamic libraries`},
+		{aliases: []string{"libraries"}, cmdFn: libraries, helpMsg: `List loaded dynamic libraries.
+
+	libraries [-d N]
+
+If used with the -d option it will re-attempt to download the debug symbols for library N, using debuginfod-find.`},
 
 		{aliases: []string{"examinemem", "x"}, group: dataCmds, cmdFn: examineMemoryCmd, helpMsg: `Examine raw memory at the given address.
 
@@ -688,7 +684,9 @@ Currently, rev next, step, step-instruction and stepout commands are supported.`
 			})
 	}
 
-	sort.Sort(byFirstAlias(c.cmds))
+	slices.SortFunc(c.cmds, func(a, b command) int {
+		return strings.Compare(a.aliases[0], b.aliases[0])
+	})
 	return c
 }
 
@@ -734,7 +732,11 @@ func (c *Commands) CallWithContext(cmdstr string, t *Term, ctx callContext) erro
 	if len(vals) > 1 {
 		args = strings.TrimSpace(vals[1])
 	}
-	return c.Find(cmdname, ctx.Prefix).cmdFn(t, ctx, args)
+	cmd := c.Find(cmdname, ctx.Prefix)
+	if t != nil && len(t.customCommandsInvalidated) > 0 && cmd.group == runCmds {
+		t.customCommandsInvalidated[len(t.customCommandsInvalidated)-1] = true
+	}
+	return cmd.cmdFn(t, ctx, args)
 }
 
 // Call takes a command to execute.
@@ -774,11 +776,9 @@ func nullCommand(t *Term, ctx callContext, args string) error {
 func (c *Commands) help(t *Term, ctx callContext, args string) error {
 	if args != "" {
 		for _, cmd := range c.cmds {
-			for _, alias := range cmd.aliases {
-				if alias == args {
-					fmt.Fprintln(t.stdout, cmd.helpMsg)
-					return nil
-				}
+			if slices.Contains(cmd.aliases, args) {
+				fmt.Fprintln(t.stdout, cmd.helpMsg)
+				return nil
 			}
 		}
 		return errNoCmd
@@ -814,12 +814,6 @@ func (c *Commands) help(t *Term, ctx callContext, args string) error {
 	return nil
 }
 
-type byThreadID []*api.Thread
-
-func (a byThreadID) Len() int           { return len(a) }
-func (a byThreadID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byThreadID) Less(i, j int) bool { return a[i].ID < a[j].ID }
-
 func threads(t *Term, ctx callContext, args string) error {
 	threads, err := t.client.ListThreads()
 	if err != nil {
@@ -829,7 +823,7 @@ func threads(t *Term, ctx callContext, args string) error {
 	if err != nil {
 		return err
 	}
-	sort.Sort(byThreadID(threads))
+	slices.SortFunc(threads, func(a, b *api.Thread) int { return cmp.Compare(a.ID, b.ID) })
 	done := false
 	t.stdout.pw.PageMaybe(func() { done = false })
 	for _, th := range threads {
@@ -879,12 +873,6 @@ func thread(t *Term, ctx callContext, args string) error {
 	fmt.Fprintf(t.stdout, "Switched from %s to %s\n", oldThread, newThread)
 	return nil
 }
-
-type byGoroutineID []*api.Goroutine
-
-func (a byGoroutineID) Len() int           { return len(a) }
-func (a byGoroutineID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byGoroutineID) Less(i, j int) bool { return a[i].ID < a[j].ID }
 
 func (c *Commands) printGoroutines(t *Term, ctx callContext, indent string, gs []*api.Goroutine, fgl api.FormatGoroutineLoc, flags api.PrintGoroutinesFlags, depth int, cmd string, pdone *bool, state *api.DebuggerState) error {
 	for _, g := range gs {
@@ -961,7 +949,7 @@ func (c *Commands) goroutines(t *Term, ctx callContext, argstr string) error {
 				fmt.Fprintf(t.stdout, "Too many groups\n")
 			}
 		} else {
-			sort.Sort(byGoroutineID(gs))
+			slices.SortFunc(gs, func(a, b *api.Goroutine) int { return cmp.Compare(a.ID, b.ID) })
 			err = c.printGoroutines(t, ctx, "", gs, fgl, flags, depth, cmd, &done, state)
 			if err != nil {
 				return err
@@ -1147,13 +1135,7 @@ func (t *Term) formatGoroutine(g *api.Goroutine, fgl api.FormatGoroutineLoc) str
 	}
 
 	if (g.Status == api.GoroutineWaiting || g.Status == api.GoroutineSyscall) && g.WaitReason != 0 {
-		var wr string
-		if g.WaitReason > 0 && g.WaitReason < int64(len(waitReasonStrings)) {
-			wr = waitReasonStrings[g.WaitReason]
-		} else {
-			wr = fmt.Sprintf("unknown wait reason %d", g.WaitReason)
-		}
-		fmt.Fprintf(buf, " [%s", wr)
+		fmt.Fprintf(buf, " [%s", api.WaitReasonString(t.goVersion(), g.WaitReason))
 		if g.WaitSince > 0 {
 			fmt.Fprintf(buf, " %d", g.WaitSince)
 		}
@@ -1161,43 +1143,6 @@ func (t *Term) formatGoroutine(g *api.Goroutine, fgl api.FormatGoroutineLoc) str
 	}
 
 	return buf.String()
-}
-
-var waitReasonStrings = [...]string{
-	"",
-	"GC assist marking",
-	"IO wait",
-	"chan receive (nil chan)",
-	"chan send (nil chan)",
-	"dumping heap",
-	"garbage collection",
-	"garbage collection scan",
-	"panicwait",
-	"select",
-	"select (no cases)",
-	"GC assist wait",
-	"GC sweep wait",
-	"GC scavenge wait",
-	"chan receive",
-	"chan send",
-	"finalizer wait",
-	"force gc (idle)",
-	"semacquire",
-	"sleep",
-	"sync.Cond.Wait",
-	"timer goroutine (idle)",
-	"trace reader (blocked)",
-	"wait for GC cycle",
-	"GC worker (idle)",
-	"preempted",
-	"debug call",
-	"GC mark termination",
-	"stopping the world",
-	"flushing proc caches",
-	"trace goroutine status",
-	"trace proc status",
-	"page trace flush",
-	"coroutine",
 }
 
 func writeGoroutineLong(t *Term, w io.Writer, g *api.Goroutine, prefix string) {
@@ -1367,12 +1312,9 @@ func parseOneRedirect(w []string, redirs *[3]string) ([]string, bool, error) {
 	prefixes := []string{"<", ">", "2>"}
 	names := []string{"stdin", "stdout", "stderr"}
 	if len(w) >= 2 {
-		for _, prefix := range prefixes {
-			if w[len(w)-2] == prefix {
-				w[len(w)-2] += w[len(w)-1]
-				w = w[:len(w)-1]
-				break
-			}
+		if slices.Contains(prefixes, w[len(w)-2]) {
+			w[len(w)-2] += w[len(w)-1]
+			w = w[:len(w)-1]
 		}
 	}
 	for i, prefix := range prefixes {
@@ -1557,7 +1499,6 @@ func stepInstruction(t *Term, ctx callContext, frame int, skipCalls bool) error 
 	}
 
 	defer t.onStop()
-
 	var fn func(bool) (*api.DebuggerState, error)
 	if ctx.Prefix == revPrefix {
 		fn = t.client.ReverseStepInstruction
@@ -1741,19 +1682,12 @@ func toggle(t *Term, ctx callContext, args string) error {
 	return nil
 }
 
-// byID sorts breakpoints by ID.
-type byID []*api.Breakpoint
-
-func (a byID) Len() int           { return len(a) }
-func (a byID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byID) Less(i, j int) bool { return a[i].ID < a[j].ID }
-
 func breakpoints(t *Term, ctx callContext, args string) error {
 	breakPoints, err := t.client.ListBreakpoints(args == "-a")
 	if err != nil {
 		return err
 	}
-	sort.Sort(byID(breakPoints))
+	slices.SortFunc(breakPoints, func(a, b *api.Breakpoint) int { return cmp.Compare(a.ID, b.ID) })
 	for _, bp := range breakPoints {
 		enabled := "(enabled)"
 		if bp.Disabled {
@@ -1812,6 +1746,9 @@ func formatBreakpointAttrs(prefix string, bp *api.Breakpoint, includeTrace bool)
 	for i := range bp.Variables {
 		attrs = append(attrs, fmt.Sprintf("%sprint %s", prefix, bp.Variables[i]))
 	}
+	for i := range bp.CustomCommands {
+		attrs = append(attrs, fmt.Sprintf("%s%s", prefix, bp.CustomCommands[i]))
+	}
 	if includeTrace && bp.Tracepoint {
 		attrs = append(attrs, fmt.Sprintf("%strace", prefix))
 	}
@@ -1823,7 +1760,6 @@ func formatBreakpointAttrs(prefix string, bp *api.Breakpoint, includeTrace bool)
 
 func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]*api.Breakpoint, error) {
 	var (
-		cond string
 		spec string
 
 		requestedBp = &api.Breakpoint{}
@@ -1862,7 +1798,7 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 		r := regexp.MustCompile(`^if | if `)
 		if match := r.FindStringIndex(argstr); match != nil {
 			requestedBp.Name = ""
-			cond = argstr[match[1]:]
+			requestedBp.Cond = argstr[match[1]:]
 			argstr = argstr[:match[0]]
 			args = config.Split2PartsBySpace(argstr)
 			if err := parseSpec(args); err != nil {
@@ -1882,13 +1818,22 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 			substSpec = substSpec2
 		}
 	}
-	if findLocErr != nil && shouldAskToSuspendBreakpoint(t) {
+
+	fns, _ := t.client.ListFunctions(`^plugin\.Open$`, 0)
+	_, err := t.client.GetState()
+	shouldAskToSuspendBreakpointQuestion := ""
+	switch {
+	case len(fns) > 0:
+		shouldAskToSuspendBreakpointQuestion = "Set a suspended breakpoint (Delve will try to set this breakpoint when a plugin is loaded) [Y/n]?"
+	case isErrProcessExited(err):
+		shouldAskToSuspendBreakpointQuestion = "Set a suspended breakpoint (Delve will try to set this breakpoint when process restarts) [Y/n]?"
+	case t.client.FollowExecEnabled():
+		shouldAskToSuspendBreakpointQuestion = "Set a suspended breakpoint (Delve will try to set this breakpoint when child processes are added) [Y/n]?"
+	}
+
+	if findLocErr != nil && shouldAskToSuspendBreakpointQuestion != "" {
 		fmt.Fprintf(os.Stderr, "Command failed: %s\n", findLocErr.Error())
-		question := "Set a suspended breakpoint (Delve will try to set this breakpoint when a plugin is loaded) [Y/n]?"
-		if isErrProcessExited(findLocErr) {
-			question = "Set a suspended breakpoint (Delve will try to set this breakpoint when the process is restarted) [Y/n]?"
-		}
-		answer, err := yesno(t.line, question, "yes")
+		answer, err := yesno(t.line, shouldAskToSuspendBreakpointQuestion, "yes")
 		if err != nil {
 			return nil, err
 		}
@@ -1920,7 +1865,6 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 			requestedBp.LoadArgs = &ShortLoadConfig
 		}
 
-		requestedBp.Cond = cond
 		bp, err := t.client.CreateBreakpointWithExpr(requestedBp, spec, t.substitutePathRules(), false)
 		if err != nil {
 			return nil, err
@@ -1941,12 +1885,12 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 	case *locspec.RegexLocationSpec:
 		shouldSetReturnBreakpoints = true
 	}
-	if tracepoint && shouldSetReturnBreakpoints && locs[0].Function != nil {
+	if tracepoint && shouldSetReturnBreakpoints {
 		for i := range locs {
 			if locs[i].Function == nil {
 				continue
 			}
-			addrs, err := t.client.(*rpc2.RPCClient).FunctionReturnLocations(locs[0].Function.Name())
+			addrs, err := t.client.(*rpc2.RPCClient).FunctionReturnLocations(locs[i].Function.Name())
 			if err != nil {
 				return nil, err
 			}
@@ -1983,22 +1927,32 @@ func tracepoint(t *Term, ctx callContext, args string) error {
 	return err
 }
 
-func getEditorName() (string, error) {
+func getEditorName() (string, []string, error) {
 	var editor string
 	if editor = os.Getenv("DELVE_EDITOR"); editor == "" {
 		if editor = os.Getenv("EDITOR"); editor == "" {
-			return "", errors.New("Neither DELVE_EDITOR or EDITOR is set")
+			return "", nil, errors.New("Neither DELVE_EDITOR or EDITOR is set")
 		}
 	}
-	return editor, nil
+
+	editorParts := strings.Fields(editor)
+	editor = editorParts[0]
+
+	var userArgs []string
+	if len(editorParts) > 1 {
+		userArgs = editorParts[1:]
+	}
+
+	return editor, userArgs, nil
 }
 
 func runEditor(args ...string) error {
-	editor, err := getEditorName()
+	editor, userArgs, err := getEditorName()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(editor, args...)
+	allArgs := append(userArgs, args...)
+	cmd := exec.Command(editor, allArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -2010,13 +1964,15 @@ func edit(t *Term, ctx callContext, args string) error {
 	if err != nil {
 		return err
 	}
-	editor, err := getEditorName()
+	editor, _, err := getEditorName()
 	if err != nil {
 		return err
 	}
 	switch editor {
 	case "code":
 		return runEditor("--goto", fmt.Sprintf("%s:%d", file, lineno))
+	case "zed":
+		return runEditor(fmt.Sprintf("%s:%d:0", file, lineno))
 	case "hx":
 		return runEditor(fmt.Sprintf("%s:%d", file, lineno))
 	case "vi", "vim", "nvim":
@@ -2178,10 +2134,7 @@ loop:
 	remsz := int(count * size)
 
 	for remsz > 0 {
-		reqsz := rpc2.ExamineMemoryLengthLimit
-		if reqsz > remsz {
-			reqsz = remsz
-		}
+		reqsz := min(rpc2.ExamineMemoryLengthLimit, remsz)
 		memArea, isLittleEndian, err := t.client.ExamineMemory(start, reqsz)
 		if err != nil {
 			return err
@@ -2702,6 +2655,21 @@ func disassCommand(t *Term, ctx callContext, args string) error {
 }
 
 func libraries(t *Term, ctx callContext, args string) error {
+	argv := config.Split2PartsBySpace(args)
+	if len(argv) == 2 {
+		switch argv[0] {
+		case "-d":
+			n, err := strconv.Atoi(argv[1])
+			if err != nil {
+				return err
+			}
+			t.client.DownloadLibraryDebugInfo(n)
+		default:
+			return errors.New("wrong arguments")
+		}
+		return nil
+	}
+
 	libs, err := t.client.ListDynamicLibraries()
 	if err != nil {
 		return err
@@ -2882,6 +2850,33 @@ func printcontextThread(t *Term, th *api.Thread) {
 	printBreakpointInfo(t, th, false)
 }
 
+// executeBreakpointCustomCommands executes custom starlark commands
+// associated with breakpoints for any thread stopped at a breakpoint.
+func (c *Commands) executeBreakpointCustomCommands(t *Term) {
+	state, err := t.client.GetState()
+	if err != nil || state == nil {
+		return
+	}
+
+	t.customCommandsInvalidated = append(t.customCommandsInvalidated, false)
+	defer func() { t.customCommandsInvalidated = t.customCommandsInvalidated[:len(t.customCommandsInvalidated)-1] }()
+
+	for _, th := range state.Threads {
+		if th.Breakpoint == nil || len(th.Breakpoint.CustomCommands) == 0 {
+			continue
+		}
+		for _, cmdName := range th.Breakpoint.CustomCommands {
+			err := c.Call(cmdName, t)
+			if err != nil {
+				fmt.Fprintf(t.stdout, "Error executing custom command %s: %v\n", cmdName, err)
+			}
+			if t.customCommandsInvalidated[len(t.customCommandsInvalidated)-1] {
+				return
+			}
+		}
+	}
+}
+
 func printBreakpointInfo(t *Term, th *api.Thread, tracepointOnNewline bool) {
 	if th.BreakpointInfo == nil {
 		return
@@ -2935,6 +2930,7 @@ func printBreakpointInfo(t *Term, th *api.Thread, tracepointOnNewline bool) {
 			printStack(t, t.stdout, bpi.Stacktrace, "\t\t", false)
 		}
 	}
+
 }
 
 func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, args string, hasReturnValue bool) {
@@ -3064,14 +3060,8 @@ func printdisass(t *Term, pc uint64) error {
 	showHeader := true
 	for i := range disasm {
 		if disasm[i].AtPC {
-			s := i - lineCount
-			if s < 0 {
-				s = 0
-			}
-			e := i + lineCount + 1
-			if e > len(disasm) {
-				e = len(disasm)
-			}
+			s := max(i-lineCount, 0)
+			e := min(i+lineCount+1, len(disasm))
 			showHeader = s == 0
 			disasm = disasm[s:e]
 			break
@@ -3577,10 +3567,4 @@ func (t *Term) formatBreakpointLocation(bp *api.Breakpoint) string {
 		fmt.Fprintf(&out, "%s:%d", p, bp.Line)
 	}
 	return out.String()
-}
-
-func shouldAskToSuspendBreakpoint(t *Term) bool {
-	fns, _ := t.client.ListFunctions(`^plugin\.Open$`, 0)
-	_, err := t.client.GetState()
-	return len(fns) > 0 || isErrProcessExited(err) || t.client.FollowExecEnabled()
 }

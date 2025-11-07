@@ -293,15 +293,23 @@ func (it *stackIterator) Next() bool {
 	return true
 }
 
-func (it *stackIterator) switchToGoroutineStack() {
+func (it *stackIterator) switchToGoroutineStack() error {
+	if it.g == nil {
+		return fmt.Errorf("nil goroutine when attempting to switch to goroutine stack")
+	}
 	it.systemstack = false
 	it.top = false
 	it.pc = it.g.PC
 	it.regs.Reg(it.regs.SPRegNum).Uint64Val = it.g.SP
 	it.regs.AddReg(it.regs.BPRegNum, op.DwarfRegisterFromUint64(it.g.BP))
-	if it.bi.Arch.Name == "arm64" || it.bi.Arch.Name == "ppc64le" || it.bi.Arch.Name == "riscv64" {
-		it.regs.Reg(it.regs.LRRegNum).Uint64Val = it.g.LR
+	if it.bi.Arch.usesLR {
+		lrReg := it.regs.Reg(it.regs.LRRegNum)
+		if lrReg == nil {
+			return fmt.Errorf("LR register is nil during stack switch")
+		}
+		lrReg.Uint64Val = it.g.LR
 	}
+	return nil
 }
 
 // Frame returns the frame the iterator is pointing at.
@@ -382,22 +390,41 @@ func (it *stackIterator) stacktrace(depth int) ([]Stackframe, error) {
 		return nil, errors.New("negative maximum stack depth")
 	}
 	frames := make([]Stackframe, 0, depth+1)
-	it.stacktraceFunc(func(frame Stackframe) bool {
+	f := func(frame Stackframe) bool {
 		frames = append(frames, frame)
 		return len(frames) < depth+1
-	})
+	}
+	it.stacktraceFunc(f)
+	if it.Err() != nil && len(frames) == 1 && it.g != nil && frames[0].SystemStack && (it.opts&StacktraceSimple == 0) {
+		// If we can't continue from the first frame, and it was on a system stack
+		// and we have a goroutine which we are allowed to switch to then switch
+		// to it and continue the stacktrace from there.
+		// This improves stacktraces produced on Windows by WER where the first
+		// thread will be executing a system function from which we can't continue
+		// to trace.
+		// See #3824.
+		it.err = nil
+		it.opts |= StacktraceG
+		it.stacktraceFunc(f)
+	}
+
 	if err := it.Err(); err != nil {
 		if len(frames) == 0 {
 			return nil, err
 		}
+
 		frames = append(frames, Stackframe{Err: err})
+
 	}
 	return frames, nil
 }
 
 func (it *stackIterator) stacktraceFunc(callback func(Stackframe) bool) {
 	if it.opts&StacktraceG != 0 && it.g != nil {
-		it.switchToGoroutineStack()
+		if err := it.switchToGoroutineStack(); err != nil {
+			it.err = err
+			return
+		}
 		it.top = true
 	}
 	for it.Next() {
@@ -481,15 +508,19 @@ func (it *stackIterator) appendInlineCalls(callback func(Stackframe) bool, frame
 // it.regs.CFA; the caller has to eventually switch it.regs when the iterator
 // advances to the next frame.
 func (it *stackIterator) advanceRegs() (callFrameRegs op.DwarfRegisters, ret uint64, retaddr uint64) {
+	logger := logflags.StackLogger()
+
 	fde, err := it.bi.frameEntries.FDEForPC(it.pc)
 	var framectx *frame.FrameContext
 	if _, nofde := err.(*frame.ErrNoFDEForPC); nofde {
 		framectx = it.bi.Arch.fixFrameUnwindContext(nil, it.pc, it.bi)
 	} else {
-		framectx = it.bi.Arch.fixFrameUnwindContext(fde.EstablishFrame(it.pc), it.pc, it.bi)
+		fctxt, err := fde.EstablishFrame(it.pc)
+		if err != nil {
+			logger.Errorf("Error executing Frame Debug Entry for PC %x: %v", it.pc, err)
+		}
+		framectx = it.bi.Arch.fixFrameUnwindContext(fctxt, it.pc, it.bi)
 	}
-
-	logger := logflags.StackLogger()
 
 	logger.Debugf("advanceRegs at %#x", it.pc)
 
@@ -564,7 +595,7 @@ func (it *stackIterator) advanceRegs() (callFrameRegs op.DwarfRegisters, ret uin
 		}
 	}
 
-	if it.bi.Arch.Name == "arm64" || it.bi.Arch.Name == "ppc64le" || it.bi.Arch.Name == "riscv64" {
+	if it.bi.Arch.usesLR {
 		if ret == 0 && it.regs.Reg(it.regs.LRRegNum) != nil {
 			ret = it.regs.Reg(it.regs.LRRegNum).Uint64Val
 		}
@@ -638,9 +669,9 @@ func (it *stackIterator) loadG0SchedSP() {
 	}
 	it.g0_sched_sp_loaded = true
 	if it.g != nil {
-		mvar, _ := it.g.variable.structMember("m")
+		mvar, _ := it.g.variable.structField("m")
 		if mvar != nil {
-			g0var, _ := mvar.structMember("g0")
+			g0var, _ := mvar.structField("g0")
 			if g0var != nil {
 				g0, _ := g0var.parseG()
 				if g0 != nil {
@@ -1058,7 +1089,7 @@ func rangeFuncStackTrace(tgt *Target, g *G) ([]Stackframe, error) {
 		return true
 	})
 	if it.Err() != nil {
-		return nil, err
+		return nil, it.Err()
 	}
 	if nonMonotonicSP {
 		return nil, errors.New("corrupted stack (SP not monotonically decreasing)")

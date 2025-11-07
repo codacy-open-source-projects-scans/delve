@@ -99,6 +99,7 @@ var (
 	loadConfErr error
 
 	rrOnProcessPid int
+	rrDelOnDetach  bool
 
 	attachWaitFor         string
 	attachWaitForInterval float64
@@ -268,6 +269,8 @@ session.`,
 	debugCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
 	debugCommand.Flags().StringVar(&tty, "tty", "", "TTY to use for the target program")
 	must(debugCommand.MarkFlagFilename("tty"))
+	debugCommand.Flags().BoolVarP(&rrDelOnDetach, "rr-cleanup", "", true,
+		"Delete directory containing debug recording on detach.")
 	rootCommand.AddCommand(debugCommand)
 
 	// 'exec' subcommand.
@@ -300,6 +303,8 @@ or later, -gcflags="-N -l" on earlier versions of Go.`,
 	execCommand.Flags().StringVar(&tty, "tty", "", "TTY to use for the target program")
 	must(execCommand.MarkFlagFilename("tty"))
 	execCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
+	execCommand.Flags().BoolVarP(&rrDelOnDetach, "rr-cleanup", "", true,
+		"Delete directory containing debug recording on detach.")
 	rootCommand.AddCommand(execCommand)
 
 	// Deprecated 'run' subcommand.
@@ -364,7 +369,7 @@ only see the output of the trace operations you can redirect stdout.`,
 	must(traceCommand.RegisterFlagCompletionFunc("stack", cobra.NoFileCompletions))
 	traceCommand.Flags().String("output", "", "Output path for the binary.")
 	must(traceCommand.MarkFlagFilename("output"))
-	traceCommand.Flags().IntVarP(&traceFollowCalls, "follow-calls", "", 0, "Trace all children of the function to the required depth")
+	traceCommand.Flags().IntVarP(&traceFollowCalls, "follow-calls", "", 0, "Trace all children of the function to the required depth. Trace also supports defer functions and cases where functions are dynamically returned and passed as parameters.")
 	rootCommand.AddCommand(traceCommand)
 
 	coreCommand := &cobra.Command{
@@ -430,6 +435,7 @@ https://github.com/mozilla/rr
 			},
 			Run: func(cmd *cobra.Command, args []string) {
 				backend = "rr"
+				rrDelOnDetach = false
 				os.Exit(execute(0, []string{}, conf, args[0], debugger.ExecutingOther, args, buildFlags))
 			},
 			ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -443,7 +449,6 @@ https://github.com/mozilla/rr
 		replayCommand.Flags().IntVarP(&rrOnProcessPid, "onprocess", "p", 0,
 			"Pass onprocess pid to rr.")
 		must(replayCommand.RegisterFlagCompletionFunc("onprocess", cobra.NoFileCompletions))
-
 		rootCommand.AddCommand(replayCommand)
 	}
 
@@ -700,6 +705,8 @@ func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 		}
 
 		var debugname string
+
+		shouldKill := true
 		if traceAttachPid == 0 {
 			if dlvArgsLen >= 2 && traceExecFile != "" {
 				fmt.Fprintln(os.Stderr, "Cannot specify package when using --exec.")
@@ -717,9 +724,11 @@ func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 			}
 
 			processArgs = append([]string{debugname}, targetArgs...)
+		} else {
+			shouldKill = false
 		}
 		if dlvArgsLen >= 3 && traceFollowCalls <= 0 {
-			fmt.Fprintln(os.Stderr, "Need to specify a trace depth of atleast 1")
+			fmt.Fprintln(os.Stderr, "Need to specify a trace depth of at least 1")
 			return 1
 		}
 
@@ -749,7 +758,7 @@ func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 			return 1
 		}
 		client := rpc2.NewClientFromConn(clientConn)
-		defer client.Detach(true)
+		defer client.Detach(shouldKill)
 
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGINT)
@@ -1136,6 +1145,7 @@ func execute(attachPid int, processArgs []string, conf *config.Config, coreFile 
 				Stderr:                proc.OutputRedirect{Path: redirects[2]},
 				DisableASLR:           disableASLR,
 				RrOnProcessPid:        rrOnProcessPid,
+				RrDelOnDetach:         rrDelOnDetach,
 				AttachWaitFor:         attachWaitFor,
 				AttachWaitForInterval: attachWaitForInterval,
 				AttachWaitForDuration: attachWaitForDuration,
@@ -1163,7 +1173,6 @@ func execute(attachPid int, processArgs []string, conf *config.Config, coreFile 
 		return 1
 	}
 
-	var status int
 	if headless {
 		if continueOnStart {
 			addr := listener.Addr().String()
@@ -1179,7 +1188,7 @@ func execute(attachPid int, processArgs []string, conf *config.Config, coreFile 
 			fmt.Println(err)
 		}
 
-		return status
+		return 0
 	}
 
 	return connect(listener.Addr().String(), clientConn, conf)

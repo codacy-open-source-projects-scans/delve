@@ -9,6 +9,9 @@ import (
 // Client represents a debugger service client. All client methods are
 // synchronous.
 type Client interface {
+	// GetVersion returns assorted version information.
+	GetVersion() *api.GetVersionOut
+
 	// ProcessPid returns the pid of the process we are debugging.
 	ProcessPid() int
 
@@ -166,6 +169,9 @@ type Client interface {
 	// SetReturnValuesLoadConfig sets the load configuration for return values.
 	SetReturnValuesLoadConfig(*api.LoadConfig)
 
+	// SetEventsFn sets a function that will be called whenever a debugger event is received.
+	SetEventsFn(func(*api.Event))
+
 	// IsMulticlient returns true if the headless instance is multiclient.
 	IsMulticlient() bool
 
@@ -208,6 +214,11 @@ type Client interface {
 	// GuessSubstitutePath tries to guess a substitute-path configuration for the client
 	GuessSubstitutePath() ([][2]string, error)
 
+	// CancelDownloads cancels binary info downloads, if any.
+	CancelDownloads() error
+	// DownloadLibraryDebugInfo attempts to download the specified library's debug info.
+	DownloadLibraryDebugInfo(n int) error
+
 	// CallAPI allows calling an arbitrary rpc method (used by starlark bindings)
-	CallAPI(method string, args, reply interface{}) error
+	CallAPI(method string, args, reply any) error
 }

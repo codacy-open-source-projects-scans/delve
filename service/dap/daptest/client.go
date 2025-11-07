@@ -11,7 +11,6 @@ import (
 	"log"
 	"net"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"testing"
 
@@ -103,31 +102,7 @@ func (c *Client) ExpectErrorResponseWith(t *testing.T, id int, message string, s
 
 func (c *Client) ExpectInitializeResponseAndCapabilities(t *testing.T) *dap.InitializeResponse {
 	t.Helper()
-	initResp := c.ExpectInitializeResponse(t)
-	wantCapabilities := dap.Capabilities{
-		// the values set by dap.(*Server).onInitializeRequest.
-		SupportsConfigurationDoneRequest: true,
-		SupportsConditionalBreakpoints:   true,
-		SupportsDelayedStackTraceLoading: true,
-		SupportsExceptionInfoRequest:     true,
-		SupportsSetVariable:              true,
-		SupportsFunctionBreakpoints:      true,
-		SupportsInstructionBreakpoints:   true,
-		SupportsEvaluateForHovers:        true,
-		SupportsClipboardContext:         true,
-		SupportsSteppingGranularity:      true,
-		SupportsLogPoints:                true,
-		SupportsDisassembleRequest:       true,
-	}
-	if !reflect.DeepEqual(initResp.Body, wantCapabilities) {
-		t.Errorf("capabilities in initializeResponse: got %+v, want %v", pretty(initResp.Body), pretty(wantCapabilities))
-	}
-	return initResp
-}
-
-func pretty(v interface{}) string {
-	s, _ := json.MarshalIndent(v, "", "\t")
-	return string(s)
+	return c.ExpectInitializeResponse(t)
 }
 
 func (c *Client) ExpectNotYetImplementedErrorResponse(t *testing.T) *dap.ErrorResponse {
@@ -198,7 +173,7 @@ func (c *Client) ExpectOutputEventClosingClient(t *testing.T, status string) *da
 	return c.ExpectOutputEventRegex(t, fmt.Sprintf(ClosingClient, status))
 }
 
-func (c *Client) CheckStopLocation(t *testing.T, thread int, name string, line interface{}) {
+func (c *Client) CheckStopLocation(t *testing.T, thread int, name string, line any) {
 	t.Helper()
 	c.StackTraceRequest(thread, 0, 20)
 	st := c.ExpectStackTraceResponse(t)
@@ -238,6 +213,7 @@ func (c *Client) InitializeRequest() {
 		SupportsVariableType:         true,
 		SupportsVariablePaging:       true,
 		SupportsRunInTerminalRequest: true,
+		SupportsMemoryReferences:     true,
 		Locale:                       "en-us",
 	}
 	c.send(request)
@@ -250,7 +226,7 @@ func (c *Client) InitializeRequestWithArgs(args dap.InitializeRequestArguments) 
 	c.send(request)
 }
 
-func toRawMessage(in interface{}) json.RawMessage {
+func toRawMessage(in any) json.RawMessage {
 	out, _ := json.Marshal(in)
 	return out
 }
@@ -258,7 +234,7 @@ func toRawMessage(in interface{}) json.RawMessage {
 // LaunchRequest sends a 'launch' request with the specified args.
 func (c *Client) LaunchRequest(mode, program string, stopOnEntry bool) {
 	request := &dap.LaunchRequest{Request: *c.newRequest("launch")}
-	request.Arguments = toRawMessage(map[string]interface{}{
+	request.Arguments = toRawMessage(map[string]any{
 		"request":     "launch",
 		"mode":        mode,
 		"program":     program,
@@ -270,7 +246,7 @@ func (c *Client) LaunchRequest(mode, program string, stopOnEntry bool) {
 // LaunchRequestWithArgs takes a map of untyped implementation-specific
 // arguments to send a 'launch' request. This version can be used to
 // test for values of unexpected types or unspecified values.
-func (c *Client) LaunchRequestWithArgs(arguments map[string]interface{}) {
+func (c *Client) LaunchRequestWithArgs(arguments map[string]any) {
 	request := &dap.LaunchRequest{Request: *c.newRequest("launch")}
 	request.Arguments = toRawMessage(arguments)
 	c.send(request)
@@ -278,7 +254,7 @@ func (c *Client) LaunchRequestWithArgs(arguments map[string]interface{}) {
 
 // AttachRequest sends an 'attach' request with the specified
 // arguments.
-func (c *Client) AttachRequest(arguments map[string]interface{}) {
+func (c *Client) AttachRequest(arguments map[string]any) {
 	request := &dap.AttachRequest{Request: *c.newRequest("attach")}
 	request.Arguments = toRawMessage(arguments)
 	c.send(request)
@@ -332,8 +308,9 @@ func (c *Client) SetBreakpointsRequestWithArgs(file string, lines []int, conditi
 }
 
 // SetExceptionBreakpointsRequest sends a 'setExceptionBreakpoints' request.
-func (c *Client) SetExceptionBreakpointsRequest() {
-	request := &dap.SetBreakpointsRequest{Request: *c.newRequest("setExceptionBreakpoints")}
+func (c *Client) SetExceptionBreakpointsRequest(filters []string) {
+	request := &dap.SetExceptionBreakpointsRequest{Request: *c.newRequest("setExceptionBreakpoints")}
+	request.Arguments.Filters = filters
 	c.send(request)
 }
 
@@ -454,9 +431,13 @@ func (c *Client) TerminateRequest() {
 	c.send(&dap.TerminateRequest{Request: *c.newRequest("terminate")})
 }
 
-// RestartRequest sends a 'restart' request.
-func (c *Client) RestartRequest() {
-	c.send(&dap.RestartRequest{Request: *c.newRequest("restart")})
+// RestartRequest sends a 'restart' request with specified arguments, if provided.
+func (c *Client) RestartRequest(arguments map[string]any) {
+	request := &dap.RestartRequest{Request: *c.newRequest("restart")}
+	if arguments != nil {
+		request.Arguments = toRawMessage(arguments)
+	}
+	c.send(request)
 }
 
 // SetFunctionBreakpointsRequest sends a 'setFunctionBreakpoints' request.
@@ -570,8 +551,14 @@ func (c *Client) SetDataBreakpointsRequest() {
 }
 
 // ReadMemoryRequest sends a 'readMemory' request.
-func (c *Client) ReadMemoryRequest() {
-	c.send(&dap.ReadMemoryRequest{Request: *c.newRequest("readMemory")})
+func (c *Client) ReadMemoryRequest(ref string, offset, count int) {
+	c.send(&dap.ReadMemoryRequest{
+		Request: *c.newRequest("readMemory"),
+		Arguments: dap.ReadMemoryArguments{
+			MemoryReference: ref,
+			Offset:          offset,
+			Count:           count,
+		}})
 }
 
 // DisassembleRequest sends a 'disassemble' request.

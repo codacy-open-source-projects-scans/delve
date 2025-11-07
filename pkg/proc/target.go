@@ -252,7 +252,7 @@ func (t *Target) Valid() (bool, error) {
 // Currently only non-recorded processes running on AMD64 support
 // function calls.
 func (t *Target) SupportsFunctionCalls() bool {
-	return t.Process.BinInfo().Arch.Name == "amd64" || (t.Process.BinInfo().Arch.Name == "arm64" && t.Process.BinInfo().GOOS != "windows") || t.Process.BinInfo().Arch.Name == "ppc64le"
+	return t.Process.BinInfo().Arch.Name == "amd64" || (t.Process.BinInfo().Arch.Name == "arm64" && t.Process.BinInfo().GOOS != "windows") || t.Process.BinInfo().Arch.Name == "ppc64le" || t.Process.BinInfo().Arch.Name == "loong64"
 }
 
 // ClearCaches clears internal caches that should not survive a restart.
@@ -343,7 +343,7 @@ func setAsyncPreemptOff(p *Target, v int64) {
 		logger.Warnf("runtime/debug variable unreadable: %v", err, debugv.Unreadable)
 		return
 	}
-	asyncpreemptoffv, err := debugv.structMember("asyncpreemptoff") // +rtype int32
+	asyncpreemptoffv, err := debugv.structField("asyncpreemptoff") // +rtype int32
 	if err != nil {
 		logger.Warnf("could not find asyncpreemptoff field: %v", err)
 		return
@@ -356,7 +356,7 @@ func setAsyncPreemptOff(p *Target, v int64) {
 	p.asyncPreemptChanged = true
 	p.asyncPreemptOff, _ = constant.Int64Val(asyncpreemptoffv.Value)
 
-	err = scope.setValue(asyncpreemptoffv, newConstant(constant.MakeInt64(v), scope.Mem), "")
+	err = scope.setValue(asyncpreemptoffv, newConstant(constant.MakeInt64(v), scope.BinInfo, scope.Mem), "")
 	if err != nil {
 		logger.Warnf("could not set asyncpreemptoff %v", err)
 	}
@@ -373,6 +373,7 @@ func (t *Target) createUnrecoveredPanicBreakpoint() {
 		if err == nil {
 			bp.Logical.Name = UnrecoveredPanic
 			bp.Logical.Variables = []string{"runtime.curg._panic.arg"}
+			bp.Logical.Set.PidAddrs = append(bp.Logical.Set.PidAddrs, PidAddr{Pid: t.Pid(), Addr: panicpcs[0]})
 		}
 	}
 }
@@ -384,6 +385,7 @@ func (t *Target) createFatalThrowBreakpoint() {
 			bp, err := t.SetBreakpoint(fatalThrowID, pcs[0], UserBreakpoint, nil)
 			if err == nil {
 				bp.Logical.Name = FatalThrow
+				bp.Logical.Set.PidAddrs = append(bp.Logical.Set.PidAddrs, PidAddr{Pid: t.Pid(), Addr: pcs[0]})
 			}
 		}
 	}
@@ -578,21 +580,45 @@ func (t *Target) dwrapUnwrap(fn *Function) *Function {
 func (t *Target) pluginOpenCallback(Thread, *Target) (bool, error) {
 	logger := logflags.DebuggerLogger()
 	for _, lbp := range t.Breakpoints().Logical {
-		if isSuspended(t, lbp) {
-			err := enableBreakpointOnTarget(t, lbp)
-			if err != nil {
-				logger.Debugf("could not enable breakpoint %d: %v", lbp.LogicalID, err)
-			} else {
-				logger.Debugf("suspended breakpoint %d enabled", lbp.LogicalID)
-			}
+		// If the breakpoint is suspended, materialize it.
+		if !lbp.isSuspendedOnTarget(t) {
+			continue
+		}
+
+		err := enableBreakpointOnTarget(t, lbp)
+		if err != nil {
+			logger.Debugf("could not enable breakpoint %d: %v", lbp.LogicalID, err)
+			continue
+		}
+
+		logger.Debugf("suspended breakpoint %d enabled", lbp.LogicalID)
+
+		// Notify the client.
+		if fn := t.BinInfo().eventsFn; fn != nil {
+			fn(&Event{
+				Kind: EventBreakpointMaterialized,
+				BreakpointMaterializedEventDetails: &BreakpointMaterializedEventDetails{
+					Breakpoint: lbp,
+				},
+			})
 		}
 	}
 	return false, nil
 }
 
-func isSuspended(t *Target, lbp *LogicalBreakpoint) bool {
+func (lbp *LogicalBreakpoint) isSuspendedOnTarget(t *Target) bool {
 	for _, bp := range t.Breakpoints().M {
 		if bp.LogicalID() == lbp.LogicalID {
+			return false
+		}
+	}
+	return true
+}
+
+func (lbp *LogicalBreakpoint) isSuspendedOnGroup(grp *TargetGroup) bool {
+	it := ValidTargets{Group: grp}
+	for it.Next() {
+		if !lbp.isSuspendedOnTarget(it.Target) {
 			return false
 		}
 	}

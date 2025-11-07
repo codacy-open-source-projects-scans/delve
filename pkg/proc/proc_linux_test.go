@@ -23,7 +23,7 @@ func mustHaveObjcopy(t *testing.T) {
 
 func TestLoadingExternalDebugInfo(t *testing.T) {
 	mustHaveObjcopy(t)
-	fixture := protest.BuildFixture("locationsprog", 0)
+	fixture := protest.BuildFixture(t, "locationsprog", 0)
 	defer os.Remove(fixture.Path)
 	stripAndCopyDebugInfo(fixture, t)
 	p, err := native.Launch(append([]string{fixture.Path}, ""), "", 0, []string{filepath.Dir(fixture.Path)}, "", "", proc.OutputRedirect{}, proc.OutputRedirect{})
@@ -36,7 +36,7 @@ func TestLoadingExternalDebugInfo(t *testing.T) {
 func TestGnuDebuglink(t *testing.T) {
 	mustHaveObjcopy(t)
 	// build math.go and make a copy of the executable
-	fixture := protest.BuildFixture("math", 0)
+	fixture := protest.BuildFixture(t, "math", 0)
 	buf, err := os.ReadFile(fixture.Path)
 	assertNoError(err, t, "ReadFile")
 	debuglinkPath := fixture.Path + "-gnu_debuglink"
@@ -85,6 +85,7 @@ func stripAndCopyDebugInfo(f protest.Fixture, t *testing.T) {
 	if err := copyCmd.Run(); err != nil {
 		t.Fatal(err)
 	}
+	protest.AddPathToRemove(f.Path + ".debug")
 
 	// Strip the original binary of the debug information.
 	stripCmd := exec.Command("strip", "--strip-debug", "--strip-unneeded", name)

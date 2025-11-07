@@ -130,6 +130,9 @@ This option can only be specified if testset is basic or a single package.`)
 }
 
 func checkCert() bool {
+	if os.Getenv("CI") != "" {
+		return true
+	}
 	if os.Getenv("NOCERT") != "" {
 		return false
 	}
@@ -302,14 +305,14 @@ func tagFlags(isTest bool) string {
 		tags = append(tags, mactags)
 	}
 	if isTest {
-		if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
-			tags = append(tags, "exp.winarm64")
-		}
 		if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
 			tags = append(tags, "exp.linuxppc64le")
 		}
 		if runtime.GOOS == "linux" && runtime.GOARCH == "riscv64" {
 			tags = append(tags, "exp.linuxriscv64")
+		}
+		if runtime.GOOS == "linux" && runtime.GOARCH == "loong64" {
+			tags = append(tags, "exp.linuxloong64")
 		}
 	}
 	if Tags != nil && len(*Tags) > 0 {

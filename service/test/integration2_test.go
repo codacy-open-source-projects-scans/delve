@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -69,7 +70,7 @@ func startServer(name string, buildFlags protest.BuildFlags, t *testing.T, redir
 	if buildMode == "pie" {
 		buildFlags |= protest.BuildModePIE
 	}
-	fixture = protest.BuildFixture(name, buildFlags)
+	fixture = protest.BuildFixture(t, name, buildFlags)
 	for i := range redirects {
 		if redirects[i] != "" {
 			redirects[i] = filepath.Join(fixture.BuildDir, redirects[i])
@@ -232,7 +233,9 @@ func TestRestart_rebuild(t *testing.T) {
 	// In the original fixture file the env var tested for is SOMEVAR.
 	t.Setenv("SOMEVAR", "bah")
 
-	withTestClient2Extended("testenv", t, 0, [3]string{}, nil, func(c service.Client, f protest.Fixture) {
+	// This test must use `testenv2` and it should be the *only* test that uses it. This is because it will overwrite
+	// the fixture file with new source.
+	withTestClient2Extended("testenv2", t, 0, [3]string{}, nil, func(c service.Client, f protest.Fixture) {
 		<-c.Continue()
 
 		var1, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "x", normalLoadConfig)
@@ -492,6 +495,14 @@ func TestClientServer_clearBreakpoint(t *testing.T) {
 
 		if e, a := 1, countBreakpoints(t, c); e != a {
 			t.Fatalf("Expected breakpoint count %d, got %d", e, a)
+		}
+
+		const nonExistentBreakpointId = 9999
+		if bp.ID != nonExistentBreakpointId {
+			_, err := c.ClearBreakpoint(nonExistentBreakpointId)
+			if err == nil {
+				t.Fatalf("Expected error, got none deleting non-existent breakpoint")
+			}
 		}
 
 		deleted, err := c.ClearBreakpoint(bp.ID)
@@ -795,28 +806,65 @@ func matchFunctions(t *testing.T, funcs []string, expected []string, depth int) 
 func TestTraceFollowCallsCommand(t *testing.T) {
 	protest.AllowRecording(t)
 	withTestClient2("testtracefns", t, func(c service.Client) {
-		depth := 3
-		functions, err := c.ListFunctions("main.A", depth)
-		assertNoError(err, t, "ListFunctions()")
-		expected := []string{"main.A", "main.B", "main.C", "main.D"}
-		matchFunctions(t, functions, expected, depth)
+		testCases := []struct {
+			funcName string
+			depth    int
+			expected []string
+		}{
+			{
+				funcName: "main.A",
+				depth:    3,
+				expected: []string{"main.A", "main.B", "main.C", "main.D"},
+			},
+			{
+				funcName: "main.first",
+				depth:    3,
+				expected: []string{"main.first", "main.second"},
+			},
+			{
+				funcName: "main.callme",
+				depth:    4,
+				expected: []string{"main.callme", "main.callme2", "main.callmed", "main.callmee"},
+			},
+			{
+				funcName: "main.F0",
+				depth:    6,
+				expected: []string{"main.F0", "main.F0.func1", "main.F1", "main.F2", "main.F3", "main.F4", "runtime.deferreturn", "runtime.gopanic", "runtime.gorecover"},
+			},
+			{
+				funcName: "main.swap",
+				depth:    3,
+				expected: []string{"main.swap", "main.swap.func1", "runtime.deferreturn"},
+			},
+			{
+				funcName: "main.nestDefer",
+				depth:    7,
+				expected: []string{"main.nestDefer", "runtime.deferreturn", "main.outer", "main.swap", "main.swap.func1"},
+			},
+			{
+				funcName: "main.namedDeferLoop",
+				depth:    3,
+				expected: []string{"main.namedDeferLoop", "runtime.deferreturn", "main.testfunc"},
+			},
+			{
+				funcName: "main.op",
+				depth:    3,
+				expected: []string{"main.formula", "main.op", "main.formula.func1"},
+			},
+			{
+				funcName: "main.dyn",
+				depth:    3,
+				expected: []string{"main.assign", "main.dyn", "main.testfunc"},
+			},
+		}
 
-		functions, err = c.ListFunctions("main.first", depth)
-		assertNoError(err, t, "ListFunctions()")
-		expected = []string{"main.first", "main.second"}
-		matchFunctions(t, functions, expected, depth)
-
-		depth = 4
-		functions, err = c.ListFunctions("main.callme", depth)
-		assertNoError(err, t, "ListFunctions()")
-		expected = []string{"main.callme", "main.callme2", "main.callmed", "main.callmee"}
-		matchFunctions(t, functions, expected, depth)
-
-		depth = 6
-		functions, err = c.ListFunctions("main.F0", depth)
-		assertNoError(err, t, "ListFunctions()")
-		expected = []string{"main.F0", "main.F0.func1", "main.F1", "main.F2", "main.F3", "main.F4", "runtime.deferreturn", "runtime.gopanic", "runtime.gorecover"}
-		matchFunctions(t, functions, expected, depth)
+		for _, tc := range testCases {
+			t.Run(tc.funcName, func(t *testing.T) {
+				functions, err := c.ListFunctions(tc.funcName, tc.depth)
+				assertNoError(err, t, "ListFunctions()")
+				matchFunctions(t, functions, tc.expected, tc.depth)
+			})
+		}
 	})
 }
 
@@ -1437,7 +1485,7 @@ func TestDisasm(t *testing.T) {
 		// look for static call to afunction() on line 29
 		found := false
 		for i := range d3 {
-			if d3[i].Loc.Line == 29 && (strings.HasPrefix(d3[i].Text, "call") || strings.HasPrefix(d3[i].Text, "CALL")) && d3[i].DestLoc != nil && d3[i].DestLoc.Function != nil && d3[i].DestLoc.Function.Name() == "main.afunction" {
+			if d3[i].Loc.Line == 29 && (strings.HasPrefix(d3[i].Text, "bl") || strings.HasPrefix(d3[i].Text, "jirl") || strings.HasPrefix(d3[i].Text, "call") || strings.HasPrefix(d3[i].Text, "CALL")) && d3[i].DestLoc != nil && d3[i].DestLoc.Function != nil && d3[i].DestLoc.Function.Name() == "main.afunction" {
 				found = true
 				break
 			}
@@ -1487,7 +1535,7 @@ func TestDisasm(t *testing.T) {
 				t.Fatal("Calling StepInstruction() repeatedly did not find the call instruction")
 			}
 
-			if strings.HasPrefix(curinstr.Text, "call") || strings.HasPrefix(curinstr.Text, "CALL") {
+			if strings.HasPrefix(curinstr.Text, "call") || strings.HasPrefix(curinstr.Text, "CALL") || strings.HasPrefix(curinstr.Text, "bl") || strings.HasPrefix(curinstr.Text, "jirl") {
 				t.Logf("call: %v", curinstr)
 				if curinstr.DestLoc == nil || curinstr.DestLoc.Function == nil {
 					t.Fatalf("Call instruction does not have destination: %v", curinstr)
@@ -1635,14 +1683,7 @@ func TestTypesCommand(t *testing.T) {
 		types, err := c.ListTypes("")
 		assertNoError(err, t, "ListTypes()")
 
-		found := false
-		for i := range types {
-			if types[i] == "main.astruct" {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(types, "main.astruct") {
 			t.Fatal("Type astruct not found in ListTypes output")
 		}
 
@@ -2067,7 +2108,7 @@ func TestAcceptMulticlient(t *testing.T) {
 		disconnectChan := make(chan struct{})
 		server := rpccommon.NewServer(&service.Config{
 			Listener:       listener,
-			ProcessArgs:    []string{protest.BuildFixture("testvariables2", 0).Path},
+			ProcessArgs:    []string{protest.BuildFixture(t, "testvariables2", 0).Path},
 			AcceptMulti:    true,
 			DisconnectChan: disconnectChan,
 			Debugger: debugger.Config{
@@ -2105,7 +2146,7 @@ func TestForceStopWhileContinue(t *testing.T) {
 		defer listener.Close()
 		server := rpccommon.NewServer(&service.Config{
 			Listener:       listener,
-			ProcessArgs:    []string{protest.BuildFixture("http_server", protest.AllNonOptimized).Path},
+			ProcessArgs:    []string{protest.BuildFixture(t, "http_server", protest.AllNonOptimized).Path},
 			AcceptMulti:    true,
 			DisconnectChan: disconnectChan,
 			Debugger: debugger.Config{
@@ -2256,7 +2297,7 @@ func (c *brokenRPCClient) Detach(kill bool) error {
 	return c.call("Detach", rpc2.DetachIn{Kill: kill}, out)
 }
 
-func (c *brokenRPCClient) call(method string, args, reply interface{}) error {
+func (c *brokenRPCClient) call(method string, args, reply any) error {
 	return c.client.Call("RPCServer."+method, args, reply)
 }
 
@@ -2493,18 +2534,42 @@ func TestDetachLeaveRunning(t *testing.T) {
 	if buildMode == "pie" {
 		buildFlags |= protest.BuildModePIE
 	}
-	fixture := protest.BuildFixture("testnextnethttp", buildFlags)
+	fixture := protest.BuildFixture(t, "testnextnethttp", buildFlags)
 
 	cmd := exec.Command(fixture.Path)
-	cmd.Stdout = os.Stdout
+
+	// Capture stdout to read the port number
+	stdout, err := cmd.StdoutPipe()
+	assertNoError(err, t, "creating stdout pipe")
 	cmd.Stderr = os.Stderr
 	assertNoError(cmd.Start(), t, "starting fixture")
 	defer cmd.Process.Kill()
 
+	// Read the port from stdout
+	var port int
+	var portLine string
+	buf := make([]byte, 256)
+	for {
+		n, err := stdout.Read(buf)
+		if err != nil {
+			t.Fatal("failed to read port from fixture stdout:", err)
+		}
+		portLine += string(buf[:n])
+		if strings.Contains(portLine, "LISTENING:") {
+			parts := strings.Split(portLine, "LISTENING:")
+			if len(parts) > 1 {
+				portStr := strings.TrimSpace(strings.Split(parts[1], "\n")[0])
+				port, err = strconv.Atoi(portStr)
+				assertNoError(err, t, "parsing port number")
+				break
+			}
+		}
+	}
+
 	// wait for testnextnethttp to start listening
 	t0 := time.Now()
 	for {
-		conn, err := net.Dial("tcp", "127.0.0.1:9191")
+		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err == nil {
 			conn.Close()
 			break
@@ -2572,7 +2637,7 @@ func TestStopServerWithClosedListener(t *testing.T) {
 	}
 	listener, err := net.Listen("tcp", "localhost:0")
 	assertNoError(err, t, "listener")
-	fixture := protest.BuildFixture("math", 0)
+	fixture := protest.BuildFixture(t, "math", 0)
 	server := rpccommon.NewServer(&service.Config{
 		Listener:           listener,
 		AcceptMulti:        false,
@@ -2600,7 +2665,12 @@ func TestGoroutinesGrouping(t *testing.T) {
 	withTestClient2("goroutinegroup", t, func(c service.Client) {
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue")
-		_, ggrp, _, _, err := c.ListGoroutinesWithFilter(0, 0, nil, &api.GoroutineGroupingOptions{GroupBy: api.GoroutineLabel, GroupByKey: "name", MaxGroupMembers: 5, MaxGroups: 10}, nil)
+		_, ggrp, _, _, err := c.ListGoroutinesWithFilter(0, 0, nil, &api.GoroutineGroupingOptions{
+			GroupBy:         api.GoroutineLabel,
+			GroupByKey:      "name",
+			MaxGroupMembers: 5,
+			MaxGroups:       10,
+		}, nil)
 		assertNoError(err, t, "ListGoroutinesWithFilter (group by label)")
 		t.Logf("%#v\n", ggrp)
 		if len(ggrp) < 5 {
@@ -2782,6 +2852,8 @@ func TestClientServer_SinglelineStringFormattedWithBigInts(t *testing.T) {
 			"9331634762088972288", "8180A06000000000",
 			"9259436018245828608", "8080200000000000",
 			"9259436018245828608", "8080200000000000",
+			"0", "0", "0", "0",
+			"0", "0", "0", "0",
 		}
 
 		for i := range xmm0var.Children {
@@ -2816,6 +2888,7 @@ func TestNonGoDebug(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("Error compiling %s: %s\n%s", path, err, out)
 	}
+	protest.AddPathToRemove(path)
 
 	listener, clientConn := service.ListenerPipe()
 	defer listener.Close()
@@ -3058,45 +3131,17 @@ func TestClientServer_breakpointOnFuncWithABIWrapper(t *testing.T) {
 	})
 }
 
-var waitReasonStrings = [...]string{
-	"",
-	"GC assist marking",
-	"IO wait",
-	"chan receive (nil chan)",
-	"chan send (nil chan)",
-	"dumping heap",
-	"garbage collection",
-	"garbage collection scan",
-	"panicwait",
-	"select",
-	"select (no cases)",
-	"GC assist wait",
-	"GC sweep wait",
-	"GC scavenge wait",
-	"chan receive",
-	"chan send",
-	"finalizer wait",
-	"force gc (idle)",
-	"semacquire",
-	"sleep",
-	"sync.Cond.Wait",
-	"timer goroutine (idle)",
-	"trace reader (blocked)",
-	"wait for GC cycle",
-	"GC worker (idle)",
-	"preempted",
-	"debug call",
-}
-
 func TestClientServer_chanGoroutines(t *testing.T) {
 	withTestClient2("changoroutines", t, func(c service.Client) {
+		ver := c.GetVersion()
+		goVer := goversion.ParseProducer(ver.TargetGoVersion)
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
 
 		countRecvSend := func(gs []*api.Goroutine) (recvq, sendq int) {
 			for _, g := range gs {
-				t.Logf("\tID: %d WaitReason: %s\n", g.ID, waitReasonStrings[g.WaitReason])
-				switch waitReasonStrings[g.WaitReason] {
+				t.Logf("\tID: %d WaitReason: %s\n", g.ID, api.WaitReasonString(&goVer, g.WaitReason))
+				switch api.WaitReasonString(&goVer, g.WaitReason) {
 				case "chan send":
 					sendq++
 				case "chan receive":
@@ -3129,6 +3174,7 @@ func TestNextInstruction(t *testing.T) {
 	withTestClient2("testprog", t, func(c service.Client) {
 		fp := testProgPath(t, "testprog")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 19})
+		assertNoError(err, t, "CreateBreakpoint()")
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
 
@@ -3155,7 +3201,17 @@ func TestBreakpointVariablesWithoutG(t *testing.T) {
 }
 
 func TestGuessSubstitutePath(t *testing.T) {
+	protest.MustHaveModules(t)
+
 	t.Setenv("NOCERT", "1")
+	ver, _ := goversion.Parse(runtime.Version())
+	if ver.IsDevelBuild() && os.Getenv("CI") != "" && runtime.GOOS == "linux" {
+		// The TeamCity builders for linux/amd64/tip and linux/arm64/tip end up
+		// with a broken .git directory which makes the 'go list' command used for
+		// GuessSubstitutePath fail.
+		t.Skip("does not work in TeamCity + tip + linux")
+	}
+
 	slashnorm := func(s string) string {
 		if runtime.GOOS != "windows" {
 			return s
@@ -3164,9 +3220,7 @@ func TestGuessSubstitutePath(t *testing.T) {
 	}
 
 	guess := func(t *testing.T, goflags string) [][2]string {
-		oldgoflags := os.Getenv("GOFLAGS")
-		os.Setenv("GOFLAGS", goflags)
-		defer os.Setenv("GOFLAGS", oldgoflags)
+		t.Setenv("GOFLAGS", goflags)
 
 		dlvbin := protest.GetDlvBinary(t)
 
@@ -3191,9 +3245,11 @@ func TestGuessSubstitutePath(t *testing.T) {
 
 		switch runtime.GOARCH {
 		case "ppc64le":
-			os.Setenv("GOFLAGS", "-tags=exp.linuxppc64le")
+			t.Setenv("GOFLAGS", "-tags=exp.linuxppc64le")
 		case "riscv64":
-			os.Setenv("GOFLAGS", "-tags=exp.linuxriscv64")
+			t.Setenv("GOFLAGS", "-tags=exp.linuxriscv64")
+		case "loong64":
+			t.Setenv("GOFLAGS", "-tags=exp.linuxloong64")
 		}
 
 		gsp, err := client.GuessSubstitutePath()
@@ -3281,6 +3337,94 @@ func TestGuessSubstitutePath(t *testing.T) {
 		}
 		if !found {
 			t.Fatalf("could not find main module path %q", delvePath)
+		}
+	})
+}
+
+func TestFollowExecFindLocation(t *testing.T) {
+	// FindLocation should not return an error if at least one of the currently
+	// attached targets can find the specified location.
+	// See issue #3933
+	if runtime.GOOS == "freebsd" || runtime.GOOS == "darwin" {
+		t.Skip("follow exec not implemented")
+	}
+	var buildFlags protest.BuildFlags
+	if buildMode == "pie" {
+		buildFlags |= protest.BuildModePIE
+	}
+	childFixture := protest.BuildFixture(t, "spawnchild", buildFlags)
+
+	withTestClient2Extended("spawn", t, 0, [3]string{}, []string{"spawn2", childFixture.Path}, func(c service.Client, fixture protest.Fixture) {
+		assertNoError(c.FollowExec(true, ""), t, "FollowExec")
+		_, err := c.CreateBreakpointWithExpr(&api.Breakpoint{File: childFixture.Source, Line: 9}, fmt.Sprintf("%s:%d", childFixture.Source, 9), nil, true)
+		assertNoError(err, t, "CreateBreakpoint(spawnchild.go:9)")
+
+		gotBreakpointMaterialized := false
+		c.SetEventsFn(func(ev *api.Event) {
+			t.Logf("event = %#v", ev)
+			if ev.Kind == api.EventBreakpointMaterialized {
+				gotBreakpointMaterialized = true
+			}
+		})
+
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue()")
+
+		if !gotBreakpointMaterialized {
+			t.Error("did not get a breakpoint materialized event")
+		}
+
+		tgts, err := c.ListTargets()
+		assertNoError(err, t, "ListTargets")
+
+		t.Logf("%v\n", tgts)
+		found := false
+		for _, tgt := range tgts {
+			if tgt.Pid == state.Pid {
+				if !strings.Contains(tgt.CmdLine, "spawnchild") {
+					t.Fatalf("did not switch to child process")
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("current target not found")
+		}
+
+		_, _, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, fmt.Sprintf("%s:%d", childFixture.Source, 6), true, nil)
+		assertNoError(err, t, "FindLocation(spawnchild.go:6)")
+
+		_, _, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, fmt.Sprintf("%s:%d", fixture.Source, 19), true, nil)
+		assertNoError(err, t, "FindLocation(spawn.go:19)")
+	})
+}
+
+func TestCancelDownload(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
+	fakedebuginfodDir, _ := filepath.Abs(filepath.Join(protest.FindFixturesDir(), "fake-debuginfod-find"))
+	t.Setenv("PATH", os.ExpandEnv(fakedebuginfodDir+":$PATH"))
+	withTestClient2("cgotest", t, func(c service.Client) {
+		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main"})
+		assertNoError(err, t, "CreateBreakpoint")
+		eventReceived := false
+		c.SetEventsFn(func(ev *api.Event) {
+			switch ev.Kind {
+			case api.EventBinaryInfoDownload:
+				eventReceived = true
+				t.Logf("download event: %q %q", ev.BinaryInfoDownloadEventDetails.ImagePath, ev.BinaryInfoDownloadEventDetails.Progress)
+				assertNoError(c.CancelDownloads(), t, "CancelDownloads")
+			}
+		})
+		t0 := time.Now()
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue")
+		if !eventReceived {
+			t.Errorf("Download event was not received")
+		}
+		if time.Since(t0) > 3*time.Second {
+			t.Errorf("Continue took to long, we probably couldn't cancel the download")
 		}
 	})
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -22,12 +23,6 @@ var EnableRace = flag.Bool("racetarget", false, "Enables race detector on inferi
 
 var runningWithFixtures bool
 
-var ldFlags string
-
-func init() {
-	ldFlags = os.Getenv("CGO_LDFLAGS")
-}
-
 // Fixture is a test binary.
 type Fixture struct {
 	// Name is the short name of the fixture.
@@ -38,6 +33,8 @@ type Fixture struct {
 	Source string
 	// BuildDir is the directory where the build command was run.
 	BuildDir string
+	// buildDone is closed when the fixture is built
+	buildDone <-chan struct{}
 }
 
 // FixtureKey holds the name and builds flags used for a test fixture.
@@ -47,17 +44,25 @@ type fixtureKey struct {
 }
 
 // Fixtures is a map of fixtureKey{ Fixture.Name, buildFlags } to Fixture.
-var fixtures = make(map[fixtureKey]Fixture)
+var fixtures = make(map[fixtureKey]*Fixture)
+var fixturesmu sync.Mutex
 
-// PathsToRemove is a list of files and directories to remove after running all the tests
-var PathsToRemove []string
+// pathsToRemove is a list of files and directories to remove after running all the tests
+var pathsToRemove []string
+var pathmu sync.Mutex
+
+func AddPathToRemove(path string) {
+	pathmu.Lock()
+	defer pathmu.Unlock()
+	pathsToRemove = append(pathsToRemove, path)
+}
 
 // FindFixturesDir will search for the directory holding all test fixtures
 // beginning with the current directory and searching up 10 directories.
 func FindFixturesDir() string {
 	parent := ".."
 	fixturesDir := "_fixtures"
-	for depth := 0; depth < 10; depth++ {
+	for range 10 {
 		if _, err := os.Stat(fixturesDir); err == nil {
 			break
 		}
@@ -96,14 +101,22 @@ func TempFile(name string) string {
 }
 
 // BuildFixture will compile the fixture 'name' using the provided build flags.
-func BuildFixture(name string, flags BuildFlags) Fixture {
+func BuildFixture(t testing.TB, name string, flags BuildFlags) Fixture {
+	t.Helper()
 	if !runningWithFixtures {
 		panic("RunTestsWithFixtures not called")
 	}
 	fk := fixtureKey{name, flags}
+	fixturesmu.Lock()
 	if f, ok := fixtures[fk]; ok {
-		return f
+		fixturesmu.Unlock()
+		<-f.buildDone
+		return *f
 	}
+	buildDone := make(chan struct{})
+	fixture := Fixture{Name: name, buildDone: buildDone}
+	fixtures[fk] = &fixture
+	fixturesmu.Unlock()
 
 	if flags&EnableCGOOptimization == 0 {
 		if os.Getenv("CI") == "" || os.Getenv("CGO_CFLAGS") == "" {
@@ -186,17 +199,6 @@ func BuildFixture(name string, flags BuildFlags) Fixture {
 		os.Exit(1)
 	}
 
-	if flags&EnableDWZCompression != 0 {
-		cmd := exec.Command("dwz", tmpfile)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			if regexp.MustCompile(`dwz: Section offsets in (.*?) not monotonically increasing`).FindString(string(out)) == "" {
-				fmt.Printf("Error running dwz on %s: %s\n", tmpfile, err)
-				fmt.Printf("%s\n", string(out))
-				os.Exit(1)
-			}
-		}
-	}
-
 	source, _ := filepath.Abs(path)
 	source = filepath.ToSlash(source)
 	sympath, err := filepath.EvalSymlinks(source)
@@ -206,10 +208,25 @@ func BuildFixture(name string, flags BuildFlags) Fixture {
 
 	absdir, _ := filepath.Abs(dir)
 
-	fixture := Fixture{Name: name, Path: tmpfile, Source: source, BuildDir: absdir}
+	fixture.Path = tmpfile
+	fixture.Source = source
+	fixture.BuildDir = absdir
+	close(buildDone)
 
-	fixtures[fk] = fixture
-	return fixtures[fk]
+	if flags&EnableDWZCompression != 0 {
+		cmd := exec.Command("dwz", tmpfile)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			if strings.Contains(string(out), "Unknown debugging section .debug_addr") {
+				t.Skip("can not run dwz")
+				return Fixture{}
+			}
+			if regexp.MustCompile(`dwz: Section offsets in (.*?) not monotonically increasing`).FindString(string(out)) == "" {
+				t.Fatalf("Error running dwz on %s: %s\n%s\n", tmpfile, err, string(out))
+			}
+		}
+	}
+
+	return fixture
 }
 
 // RunTestsWithFixtures sets the flag runningWithFixtures to compile fixtures on demand and runs tests with m.Run().
@@ -226,7 +243,7 @@ func RunTestsWithFixtures(m *testing.M) {
 		os.Remove(f.Path)
 	}
 
-	for _, p := range PathsToRemove {
+	for _, p := range pathsToRemove {
 		fi, err := os.Stat(p)
 		if err != nil {
 			panic(err)
@@ -318,6 +335,11 @@ func MustSupportFunctionCalls(t *testing.T, testBackend string) {
 	if runtime.GOARCH == "riscv64" {
 		t.Skip(fmt.Errorf("%s does not support FunctionCall for now", runtime.GOARCH))
 	}
+	if runtime.GOARCH == "loong64" {
+		if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 24) {
+			t.Skip("function calls not supported on loong64 with Go < 1.24")
+		}
+	}
 	if runtime.GOARCH == "arm64" {
 		if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 19) || runtime.GOOS == "windows" {
 			t.Skip("this version of Go does not support function calls")
@@ -362,7 +384,7 @@ func WithPlugins(t *testing.T, flags BuildFlags, plugins ...string) []Fixture {
 
 	r := make([]Fixture, len(plugins))
 	for i := range plugins {
-		r[i] = BuildFixture(plugins[i], flags|BuildModePlugin)
+		r[i] = BuildFixture(t, plugins[i], flags|BuildModePlugin)
 	}
 	return r
 }
@@ -386,11 +408,17 @@ func MustHaveCgo(t *testing.T) {
 	}
 }
 
+func MustHaveModules(t *testing.T) {
+	if os.Getenv("GO111MODULE") == "off" {
+		t.Skip("skipping test which requires go modules")
+	}
+}
+
 func RegabiSupported() bool {
 	// Tracks regabiSupported variable in ParseGOEXPERIMENT internal/buildcfg/exp.go
 	switch {
 	case goversion.VersionAfterOrEqual(runtime.Version(), 1, 18):
-		return runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64" || runtime.GOARCH == "ppc64le" || runtime.GOARCH == "ppc64" || runtime.GOARCH == "riscv64"
+		return runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64" || runtime.GOARCH == "ppc64le" || runtime.GOARCH == "ppc64" || runtime.GOARCH == "riscv64" || runtime.GOARCH == "loong64"
 	case goversion.VersionAfterOrEqual(runtime.Version(), 1, 17):
 		return runtime.GOARCH == "amd64" && (runtime.GOOS == "android" || runtime.GOOS == "linux" || runtime.GOOS == "darwin" || runtime.GOOS == "windows")
 	default:
@@ -419,39 +447,56 @@ func ProjectRoot() string {
 }
 
 func GetDlvBinary(t *testing.T) string {
-	// In case this was set in the environment
-	// from getDlvBinEBPF lets clear it here, so
-	// we can ensure we don't get build errors
-	// depending on the test ordering.
-	t.Setenv("CGO_LDFLAGS", ldFlags)
+	t.Helper()
+
 	var tags []string
-	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
-		tags = []string{"-tags=exp.winarm64"}
-	}
 	if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
 		tags = []string{"-tags=exp.linuxppc64le"}
 	}
 	if runtime.GOOS == "linux" && runtime.GOARCH == "riscv64" {
 		tags = []string{"-tags=exp.linuxriscv64"}
 	}
+	if runtime.GOOS == "linux" && runtime.GOARCH == "loong64" {
+		tags = []string{"-tags=exp.linuxloong64"}
+	}
 	return getDlvBinInternal(t, tags...)
 }
 
 func GetDlvBinaryEBPF(t *testing.T) string {
+	t.Helper()
+
 	return getDlvBinInternal(t, "-tags", "ebpf")
 }
 
+// Fixtures is a map of fixtureKey{ Fixture.Name, buildFlags } to Fixture.
+var dlvbincache = make(map[string]string)
+var dlvbinmu sync.Mutex
+
 func getDlvBinInternal(t *testing.T, goflags ...string) string {
-	dlvbin := filepath.Join(t.TempDir(), "dlv.exe")
+	dlvbinmu.Lock()
+	defer dlvbinmu.Unlock()
+
+	// Parse GOFLAGS and filter out empty strings
+	goenvflags := os.Getenv("GOFLAGS")
+	if goenvflags != "" {
+		goflags = slices.Concat(goflags, strings.Split(os.Getenv("GOFLAGS"), " "))
+	}
+
+	strargs := strings.Join(goflags, "")
+	if path, ok := dlvbincache[strargs]; ok {
+		return path
+	}
+
+	dlvbin := TempFile("dlv.exe")
+
+	dlvbincache[strargs] = dlvbin
+	AddPathToRemove(dlvbin)
+
 	args := append([]string{"build", "-o", dlvbin}, goflags...)
 	args = append(args, "github.com/go-delve/delve/cmd/dlv")
-
-	wd, _ := os.Getwd()
-	fmt.Printf("at %s %s\n", wd, goflags)
-
 	out, err := exec.Command("go", args...).CombinedOutput()
 	if err != nil {
-		t.Fatalf("go build -o %v github.com/go-delve/delve/cmd/dlv: %v\n%s", dlvbin, err, string(out))
+		t.Fatalf("go %s: %v\n%s", strings.Join(args, " "), err, string(out))
 	}
 
 	return dlvbin
